@@ -37,14 +37,14 @@ import java.util.ArrayList;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.Iterator;
-import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
-import java.util.Queue;
 import java.util.UUID;
 import java.util.Vector;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import javax.xml.parsers.DocumentBuilder;
@@ -239,8 +239,6 @@ public class ApplicationMaster {
   // TODO
   // For status update for clients - yet to be implemented
 
-  // 以下三个参数可以被client使用来完成RPC通讯（向RM注册时使用！）
-  // TODO - 通过soap或者rpc将以下信息发送给portal，以便portal提交job
   // Hostname of the container
   private String appMasterHostname = "";
   // Port on which the app master listens for status updates from clients
@@ -248,14 +246,6 @@ public class ApplicationMaster {
   // Tracking url to which app master publishes info for clients to monitor
   private String appMasterTrackingUrl = "";
 
-  /**
-   * 2015.05.05
-   * TODO - 这些都以所有task使用相同的container为前提，考虑多个不同container的情况！
-   */
-  // App Master configuration
-  // TODO - 这里的numTotalContainers是要申请的container的数量，默认值为1，在client提交job时就已经提前定义;
-  //        iVIC5.0中，numTotalContainers是根据job分解成task的数量来确定的，除了vcluster，大部分情况都是1或2；
-  //        后续改动中注意此处！！！
   // No. of containers to run shell command on
   @VisibleForTesting
   protected int numTotalContainers = 1;
@@ -265,6 +255,10 @@ public class ApplicationMaster {
   private int containerVirtualCores = 1;
   // Priority of the request
   private int requestPriority;
+  
+  private int maxMem = 512;
+  
+  private int maxVCores = 1;
 
   /**
    * numCompletedContainers:已经完成的container数量（包括成功和失败）
@@ -288,21 +282,6 @@ public class ApplicationMaster {
   // Only request for more if the original requirement changes.
   @VisibleForTesting
   protected AtomicInteger numRequestedContainers = new AtomicInteger();
-
-  // ivic portal user id
-  private static String userID = null;
-
-  // get table name from task and job's target_object_type
-  private Map<String, String> tables = new HashMap<String, String>();
-  // operationToState is for update the tasks' object during operations
-  private Map<String, String> operationToState = new HashMap<String, String>();
-  // FinishedTransDict is for update the status of successfully finished jobs
-  
-  // 根据虚拟机操作匹配后台方法
-  private Map<String, String> vmMethodMapping = new HashMap<String, String>();
-  
-  // 保存task的队列
-  Queue<Task> tasks = new LinkedList<Task>();
   
   // Shell command to be executed
   private String shellCommand = "";
@@ -349,7 +328,23 @@ public class ApplicationMaster {
 
   private final String linux_bash_command = "bash";
   private final String windows_command = "cmd /c";
+  
+  //ivic portal user id
+  private static String userID = null;
 
+  // get table name from task and job's target_object_type
+  private Map<String, String> tables = new HashMap<String, String>();
+  // operationToState is for update the tasks' object during operations
+  private Map<String, String> operationToState = new HashMap<String, String>();
+  // FinishedTransDict is for update the status of successfully finished jobs
+ 
+  // 根据虚拟机操作匹配后台方法
+  private Map<String, String> vmMethodMapping = new HashMap<String, String>();
+ 
+  // 保存task的队列
+  // BlockingQueue是一个阻塞队列
+  BlockingQueue<Task> taskQueue = new LinkedBlockingQueue<Task>();
+  
   /**
    * @param args Command line args
    */
@@ -675,70 +670,26 @@ public class ApplicationMaster {
     // Dump out information about cluster capability as seen by the
     // resource manager
     
-    int maxMem = response.getMaximumResourceCapability().getMemory();
+    maxMem = response.getMaximumResourceCapability().getMemory();
     LOG.info("Max mem capabililty of resources in this cluster " + maxMem);
     
-    int maxVCores = response.getMaximumResourceCapability().getVirtualCores();
+    maxVCores = response.getMaximumResourceCapability().getVirtualCores();
     LOG.info("Max vcores capabililty of resources in this cluster " + maxVCores);
     
-    // task队列
-    Queue<Task> taskQue = new LinkedList<Task>(); 
     // AppMaster循环访问数据库，while(true)
     ConnectDataBase con = new ConnectDataBase();
-    doLoop(con);
     
-    	// A resource ask cannot exceed the max.
-	    if (containerMemory > maxMem) {
-	      LOG.info("Container memory specified above max threshold of cluster."
-	          + " Using max value." + ", specified=" + containerMemory + ", max="
-	          + maxMem);
-	      containerMemory = maxMem;
-	    }
-
-	    if (containerVirtualCores > maxVCores) {
-	      LOG.info("Container virtual cores specified above max threshold of cluster."
-	          + " Using max value." + ", specified=" + containerVirtualCores + ", max="
-	          + maxVCores);
-	      containerVirtualCores = maxVCores;
-	    }
-	    
-	    /**
-	     * TODO - 按照DShell的逻辑，AM注册后返回的response中包含了已分配的资源，但是和原始提交的有关系？
-	     * 还是说AM重启的时候使用？？
-	     */
-	    
-        // 获取已经分配的container数量
-        List<Container> previousAMRunningContainers =
-            response.getContainersFromPreviousAttempts();
-        LOG.info(appAttemptID + " received " + previousAMRunningContainers.size()
-          + " previous attempts' running containers on AM registration.");
-        numAllocatedContainers.addAndGet(previousAMRunningContainers.size());
-
-        // 要申请的container数量 = 总的container数量 - 已经分配的container的数量
-        // numTotalContainers为默认值，在ivic中，应该根据task的数量来确定
-        int numTotalContainersToRequest =
-            numTotalContainers - previousAMRunningContainers.size();
-
-        // Setup ask for containers from RM
-        // Send request for containers to RM
-        // Until we get our fully allocated quota, we keep on polling RM for
-        // containers
-        // Keep looping until all the containers are launched and shell script
-        // executed on them ( regardless of success/failure).
-        for (int i = 0; i < numTotalContainersToRequest; ++i) {
-          ContainerRequest containerAsk = setupContainerAskForRM();
-          amRMClient.addContainerRequest(containerAsk);
-        }
-        // 至此，所有的container都已经向RM发出了request
-        numRequestedContainers.set(numTotalContainers);
-
-        publishApplicationAttemptEvent(timelineClient, appAttemptID.toString(),
-            DSEvent.DS_APP_ATTEMPT_END, domainId, appSubmitterUgi);
+    // 暂时创建一个读线程
+    Runnable r = new TaskRunner(taskQueue);
+    Thread thread = new Thread(r);
+    thread.start();
+    
+    doLoop(con);
   }
   
   private void doLoop(ConnectDataBase con) throws SQLException {
       ResultSet rs = null;
-      String jobId;
+      //String jobId;
       String sql;
       while (true) {
           // step1. find out timeout tasks and update the status
@@ -774,21 +725,15 @@ public class ApplicationMaster {
           rs = con.executeQuery(sql);
           try {
               while (rs.next()) {
-                  jobId = rs.getString(0);
-                  // update the status of the job's object only if it belongs to Class Vcluster
-                  String target = rs.getString("target_object_type");
-                  if (target.equals("Vcluster") || target.equals("Vnet")) {
-                      sql = "update " + target + " set status = " + operationToState.get(rs.getString("pending"));
-                      con.executeUpdate(sql);
-                  }
+                  //jobId = rs.getString(0);
                   // TODO 将job分解为多个task,并将task放入队列;构建一个task队列和一个failed task的hashmap，相同的failed的job id的task至保存一个即可
                   TaskGenerator(con, rs);
 
                   // TODO 存在通过改ResultSet来更改数据库记录的方法
                   // 如果有将task保存下来的功能则存在中间状态转换，但是如果将job解析完成后直接请求container执行咋办？   
-                  sql = "update jobs set status = 'scheduling' where id = " + jobId;
-                  con.executeUpdate(sql);
-                  LOG.info("update jobs status success!");
+                  //sql = "update jobs set status = 'scheduling' where id = " + jobId;
+                  //con.executeUpdate(sql);
+                  //LOG.info("update jobs status success!");
               }
           }
           catch (SQLException e) {
@@ -797,14 +742,14 @@ public class ApplicationMaster {
               e.printStackTrace();
           }
 		  
-		  // TODO
+		  // TODO 这一步在task状态执行完后，由执行结果修改job和vm的状态
 		  // step3.update status of finished jobs
 		  
-		  // TODO
-		  // step4. handle the waiting tasks
+		  // TODO 这一步和多线程有关，现在只实现单线程
+          // step5. handle the pending tasks
 		  
-		  // step5. handle the pending tasks
-		  
+          // step6. sleep for 1 sec
+          // sleep(1);
 	  }
   }
 
@@ -1391,12 +1336,6 @@ public class ApplicationMaster {
 	  else if (jobObject.equals("Vdisk")) {
           
       }
-	  else if (jobObject.equals("Vcluster")) {
-		  
-	  }
-	  else if (jobObject.equals("Vnet")) { // TODO 暂时使用vlan，只有openvpn的时候才会有vnet的task
-		  
-	  }
 	  else {// TODO - 增加其他类型task的分解过程
 		  LOG.error("Target object type is wrong!");
 	  }
@@ -1407,15 +1346,17 @@ public class ApplicationMaster {
       String vmSetting = null;
       String uuid = null;
       String sql = null;
+      String shellArgs = null;
       Task task = new Task();
-      HashMap<String, String> map = new HashMap<String, String>();
-      map.put("uuid", uuid);
+      // 保存参数，和原数据库保持一致，都是一个hash表
+      //HashMap<String, String> map = new HashMap<String, String>();
+      //map.put("uuid", uuid);
 
       // 默认值
-      containerMemory = 10;
-      containerVirtualCores = 1;
+      int containerMemory = 10;
+      int containerVirtualCores = 1;
       
-      // deploy和edit时，只是把资源信息写入xml中，并没有真正使用；资源使用发生在虚拟机运行时(start)
+      // deploy和edit时，只是把资源信息写入xml中，并没有真正使用；资源使用发生在虚拟机运行时(start)，所以资源量重新赋值
       if (jobOperation.equals("deploy") || jobOperation.equals("edit") || jobOperation.equals("start")) {
           sql = "select * from virtual_machines where id = " + jobObjectId;
           ResultSet rSet = con.executeQuery(sql);
@@ -1437,20 +1378,20 @@ public class ApplicationMaster {
               }
               else {
                   shellArgs = vmMethodMapping.get(jobOperation) + " \\\"" + uuid + "\\\" \\\"" + vmSetting + "\\\"";
-                  map.put("xml", vmSetting);
+                  //map.put("xml", vmSetting);
               }
           }
       }
       else if (jobOperation.equals("stop")) { // 如果options为destroy，则shutdown即强制关闭VM;若为NULL，则是正常关闭
           shellArgs = vmMethodMapping.get(jobOperation) + " " + uuid + " " + jobOption;
-          map.put("stopMode", jobOption);
+          //map.put("stopMode", jobOption);
       }
       else if (jobOperation.equals("undeploy")) { 
           task.setSoapMethod("undeployVM");
           // 数据库中的option字段为“{“delete_vdisk => yes/no”}”,是一个hash表
           if (jobOption.split("=>")[1].equals("yes")) {
               shellArgs = vmMethodMapping.get(jobOperation) + " " + uuid + " yes";
-              map.put("delete", "yes");
+              //map.put("delete", "yes");
           }
           else {
               shellArgs = vmMethodMapping.get(jobOperation) + " " + uuid;
@@ -1461,26 +1402,27 @@ public class ApplicationMaster {
       // 生成task对象，保存在队列和数据库中
       task.setUuid(UUID.randomUUID().toString());
       task.setJobId(jobId);
-      task.setDependingTaskId(dependingTaskId);
+      //task.setDependingTaskId(dependingTaskId);
       task.setTargetObjectId(jobObjectId);
       task.setTargetObjectType("VirtualMachine");
       task.setOperation(jobOperation);
       task.setMemory(containerMemory);
       task.setVcpu(containerVirtualCores);
-      task.setSoapMethod(vmMethodMapping.get(jobOperation));
-      task.setSoapArgs(map.toString());
-      task.setStatus(dependingTaskId == null ? "pending" : "waiting");
-      task.setTitle(task.getOperation() + " vmi " + task.getTargetObjectId());
+      //task.setSoapMethod(vmMethodMapping.get(jobOperation));
+      //task.setSoapArgs(map.toString());
+      task.setShellArgs(shellArgs);
+      //task.setStatus(dependingTaskId == null ? "pending" : "waiting");
+      task.setStatus("pending");
+      //task.setTitle(task.getOperation() + " vmi " + task.getTargetObjectId());
       SimpleDateFormat sDateFormat = new SimpleDateFormat("yyyy-MM-dd hh:mm:ss");     
       String createdTime = sDateFormat.format(new java.util.Date());
       task.setCreatedTime(createdTime);
       // 将task保存在队列中
-      tasks.offer(task);
-      sql = "insert into tasks values ('2000', '" + task.getUuid() + "', '" + task.getJobId() + "', '" + task.getTitle() + "', '" 
-              + task.getDescrition() + "', '" + task.getStatus() + "', '" + task.getDependingTaskId() + "', '" + task.getTaskInfo() + "', '"
-              + createdTime + "', '" + createdTime + "', '" + task.getTargetObjectId() + "', '" + task.getTargetObjectType() + "', '" + task.getOperation() + "', '"
-              + task.getSoapMethod() + "', '" + task.getSoapArgs() + "', " + null + ")";
+      taskQueue.offer(task);
+      // job.status: pending => scheduling
+      sql = "update jobs set status = 'scheduling' where id = " + jobId;
       con.executeUpdate(sql);
+      LOG.info("update jobs status success!");
   }
   
   // ****************************************************
@@ -1488,7 +1430,7 @@ public class ApplicationMaster {
   // 1.先生成一个xml文档
   // 2.将xml转换为字符串
   // ****************************************************  
-  public static String generateVmSetting(ConnectDataBase con, ResultSet rs) {
+  private static String generateVmSetting(ConnectDataBase con, ResultSet rs) {
 		String xmlStr = null;
 		String sql;
 		ResultSet rSet;
@@ -1679,43 +1621,63 @@ public class ApplicationMaster {
 	    return xmlStr;
 	}
   
-  //增加解析xml的接口,用来解析ivic_job和ivic_xml
-  /*
-  public static Document xmlParser(String xml) { 
-	  DocumentBuilderFactory builderFactory = DocumentBuilderFactory.newInstance(); 
-	  Document xmldoc = null; 
-	  try { 
-		  builderFactory.setIgnoringElementContentWhitespace(true); 
-		  //DOM parser instance 
-		  DocumentBuilder builder = builderFactory.newDocumentBuilder(); 
-		  //parse an XML string into a DOM tree 
-		  xmldoc = builder.parse(new InputSource(new StringReader(xml))); 
-	  } catch (Exception e) { 
-		  e.printStackTrace(); 
-	  } 
-	  return xmldoc; 
-  }*/
+  // TODO 这里先用单线程实现，后期可以改为多线程
+  public class TaskRunner implements Runnable {
+      private BlockingQueue<Task> queue;
+      //private ConcurrentLinkedQueue<Task> queue1;
+      
+      public TaskRunner(BlockingQueue<Task> queue) {
+          this.queue = queue;
+      }
+      
+      ConnectDataBase con = new ConnectDataBase();
+      String sql;
+      public void run() {
+          while(true) {
+              if (queue.peek() == null) {
+                  Task task = queue.poll();
+                  doTask(task);
+              }
+          }
+      }
+      
+      private void doTask(Task task) {
+          // TODO 更新vm/vdisk的状态
+          if (task.getTargetObjectId() != null) {
+              sql = "update " + tables.get(task.getTargetObjectType()) + " set status = '" + operationToState.get(task.getOperation()) + "' where id = " + task.getTargetObjectId();
+              LOG.info(sql);
+              con.executeUpdate(sql);
+          }
+          containerMemory = task.getMemory();
+          containerVirtualCores = task.getVcpu();
+          
+          // A resource ask cannot exceed the max.
+          if (containerMemory > maxMem) {
+            LOG.info("Container memory specified above max threshold of cluster."
+                + " Using max value." + ", specified=" + containerMemory + ", max="
+                + maxMem);
+            containerMemory = maxMem;
+          }
 
-/*
-  public static void saveXml(String fileName, Document doc) { 
-	  TransformerFactory transFactory=TransformerFactory.newInstance(); 
-	  try { 
-		  Transformer transformer = transFactory.newTransformer(); 
-		  transformer.setOutputProperty("indent", "yes"); 
-		 
-		  DOMSource source=new DOMSource(); 
-		  source.setNode(doc); 
-		  StreamResult result=new StreamResult(); 
-		  result.setOutputStream(new FileOutputStream(fileName)); 
-		             
-		  transformer.transform(source, result); 
-	  } catch (TransformerConfigurationException e) { 
-		  e.printStackTrace(); 
-	  } catch (TransformerException e) { 
-		  e.printStackTrace(); 
-	  } catch (FileNotFoundException e) { 
-		  e.printStackTrace(); 
-	  }    
-  } 
-  */
+          if (containerVirtualCores > maxVCores) {
+            LOG.info("Container virtual cores specified above max threshold of cluster."
+                + " Using max value." + ", specified=" + containerVirtualCores + ", max="
+                + maxVCores);
+            containerVirtualCores = maxVCores;
+          }
+
+          // Setup ask for containers from RM
+          // Send request for containers to RM
+          // Until we get our fully allocated quota, we keep on polling RM for
+          // containers
+          // Keep looping until all the containers are launched and shell script
+          // executed on them ( regardless of success/failure).
+          ContainerRequest containerAsk = setupContainerAskForRM();
+          amRMClient.addContainerRequest(containerAsk);
+          
+          publishApplicationAttemptEvent(timelineClient, appAttemptID.toString(),
+                  DSEvent.DS_APP_ATTEMPT_END, domainId, appSubmitterUgi);
+      }
+  }
+  
 }
