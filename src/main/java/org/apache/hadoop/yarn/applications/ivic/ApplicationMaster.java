@@ -679,6 +679,10 @@ public class ApplicationMaster {
     // AppMaster循环访问数据库，while(true)
     ConnectDataBase con = new ConnectDataBase();
     
+    String sql = "update users set app_master_hostname = '" + appMasterHostname + "' where id = " + userID;
+    con.executeUpdate(sql);
+    LOG.info("update appMaster hostname in portal database!");
+    
     // 暂时创建一个读线程
     Runnable r = new TaskRunner(taskQueue);
     Thread thread = new Thread(r);
@@ -1666,6 +1670,8 @@ public class ApplicationMaster {
             containerVirtualCores = maxVCores;
           }
 
+          shellArgs = task.getShellArgs();
+          
           // Setup ask for containers from RM
           // Send request for containers to RM
           // Until we get our fully allocated quota, we keep on polling RM for
@@ -1673,11 +1679,16 @@ public class ApplicationMaster {
           // Keep looping until all the containers are launched and shell script
           // executed on them ( regardless of success/failure).
           ContainerRequest containerAsk = setupContainerAskForRM();
-          amRMClient.addContainerRequest(containerAsk);
+          extracted(containerAsk);
           
           publishApplicationAttemptEvent(timelineClient, appAttemptID.toString(),
                   DSEvent.DS_APP_ATTEMPT_END, domainId, appSubmitterUgi);
       }
+
+    @SuppressWarnings("unchecked")
+    private void extracted(ContainerRequest containerAsk) {
+        amRMClient.addContainerRequest(containerAsk);
+    }
   }
   
 }

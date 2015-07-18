@@ -156,10 +156,8 @@ public class Client {
   // Shell Command Container priority 
   private int shellCmdPriority = 0;
   
-  //2015.05.05 iVIC job
-  private String ivicJob = "";
-  private String vmSetting = "";
-  private String uuid = "";
+  //ivic portal user id
+  private String userID = "";
 
   // Amt of memory to request for container in which shell script will be executed
   private int containerMemory = 10; 
@@ -272,10 +270,8 @@ public class Client {
     yarnClient.init(conf);
     opts = new Options();
     LOG.info("**********准备*********");
-    //add ivic_job/xml/uuid参数
-    opts.addOption("ivic_job", true, "First job of the iVIC current user.");
-    opts.addOption("vm_setting", true, "Ivic vm_setting info.");
-    opts.addOption("uuid", true, "Uuid of VirtualMachine or Vdisk or Vswitch in iVIC.");
+    //add portal user's id
+    opts.addOption("user_id", true, "user id.");
     LOG.info("**********添加ivic_job等参数*********");
     opts.addOption("appname", true, "Application Name. Default value - DistributedShell");
     opts.addOption("priority", true, "Application Priority. Default 0");
@@ -401,7 +397,6 @@ public class Client {
     appMasterJar = cliParser.getOptionValue("jar");
 
     /**
-     * add by kongs.2015/05/04
      * 在iVIC5.0中，user第一次提交job时，portal提交distributedshell任务，启动AppMaster，然后自动执行job[一般会将一个job分解为多个task]
      * portal执行RPC调用，传入job信息【应该是一个xml文件或者map结构体，里面保存分解job需要的信息】；
      * 而在DShell-client接收到iVIC参数后，不进行处理，直接通过启动AM命令的参数形式传送给AM
@@ -478,21 +473,9 @@ public class Client {
       }
     }
     
-    LOG.info("**********检查有没有ivic_job参数*********");
-    //2015.05.05 save job from args
-    if (cliParser.hasOption("ivic_job")) {
-    	ivicJob = cliParser.getOptionValue("ivic_job");
-    }
-    LOG.info("**********检查ivic_job参数完毕*********");
+    userID = cliParser.getOptionValue("user_id");
+    LOG.info("*******user_id:" + userID);
     
-    if (cliParser.hasOption("vm_setting")) {
-    	vmSetting = cliParser.getOptionValue("vm_setting");
-    }
-    
-    if (cliParser.hasOption("uuid")) {
-    	uuid = cliParser.getOptionValue("uuid");
-    }
-
     return true;
   }
 
@@ -508,7 +491,6 @@ public class Client {
     yarnClient.start();//更改状态，启动服务 add by kongs.
 
     /**
-     * add by kongs. 
      * YarnClusterMetrics represents cluster metrics. 
      * Currently only number of <code>NodeManager</code>s is provided.
      */
@@ -516,7 +498,7 @@ public class Client {
     LOG.info("Got Cluster metric info from ASM" 
         + ", numNodeManagers=" + clusterMetrics.getNumNodeManagers());
 
-    //add by kongs. 返回处于running状态的Node，也就是slave
+    //返回处于running状态的Node，也就是slave
     List<NodeReport> clusterNodeReports = yarnClient.getNodeReports(
         NodeState.RUNNING);
     LOG.info("Got Cluster node info from ASM");
@@ -599,7 +581,6 @@ public class Client {
     // Copy the application master jar to the filesystem 
     // Create a local resource to point to the destination jar path
     /**
-     * add by kongs.
      * 这里指定了复制AppMaster jar文件到文件系统的位置，默认配置应该就是HDFS；若要使用其他如zookeeper，可在配置文件中更改
      */
     FileSystem fs = FileSystem.get(conf);
@@ -619,7 +600,6 @@ public class Client {
     // We do not need to set this as a local resource for the application 
     // master as the application master does not need it.
     /**
-     * add by kongs.
      * 将最终要执行的脚本文件上传到hdfs以便最终在container中执行；
      * 之所以没有将脚本设置成一个local resource给AppMaster,是因为AppMaster并不需要脚本，它只管申请资源，不关心container中的执行内容
      */
@@ -640,7 +620,6 @@ public class Client {
     }
 
     /**
-     * add by kongs.
      * 如果最终要执行一条shell命令(在container中执行的命令)，这里直接把这条命令当作ApplicationSubmissionContext的local resource来对待
      */
     if (!shellCommand.isEmpty()) {
@@ -649,21 +628,12 @@ public class Client {
     }
 
     /**
-     * add by kongs.2015/05/04
      * 执行的命令有参数，则当作local resource
      */
     if (shellArgs.length > 0) {
       addToLocalResources(fs, null, shellArgsPath, appId.toString(),
           localResources, StringUtils.join(shellArgs, " "));
     }
-    
-    //2015.05.05 add job to local resource
-    /*
-    if (!ivicJob.isEmpty()) {
-        addToLocalResources(fs, null, ivicJobPath, appId.toString(),
-            localResources, ivicJob);
-      }
-      */
 
     // Set the necessary security tokens as needed
     //amContainer.setContainerTokens(containerToken);
@@ -676,7 +646,6 @@ public class Client {
     // using the env info, the application master will create the correct local resource for the 
     // eventual containers that will be launched to execute the shell scripts
     /**
-     * add by kongs.2015/05/04
      * 其实最后还是要把shell script的相关信息添加到AppMaster的env中；
      * 只不过这些信息是shell脚本文件在上传到hdfs后的参数信息，因为AppMaster必须要知道脚本文件的位置才能执行
      */
@@ -713,7 +682,6 @@ public class Client {
     env.put("CLASSPATH", classPathEnv.toString());
 
     /**
-     * add by kongs.
      * 以下是启动AppMaster的命令信息，包括分配给启动AppMaster的内存、CPU信息
      */
     // Set the necessary command to execute the application master 
@@ -732,10 +700,8 @@ public class Client {
     vargs.add("--container_vcores " + String.valueOf(containerVirtualCores));
     vargs.add("--num_containers " + String.valueOf(numContainers));
     
-    // 在启动AM的命令中添加iVIC相应的参数
-    vargs.add("--ivic_job " + "\\\"" + String.valueOf(ivicJob) + "\\\"");
-    vargs.add("--vm_setting " + "\\\"" + String.valueOf(vmSetting) + "\\\"");
-    vargs.add("--uuid " + "\\\"" + String.valueOf(uuid) + "\\\"");
+    // 在启动AM的命令中添加user_id
+    vargs.add("--user_id " + "\\\"" + String.valueOf(userID) + "\\\"");
     
     if (null != nodeLabelExpression) {
       appContext.setNodeLabelExpression(nodeLabelExpression);
@@ -764,7 +730,6 @@ public class Client {
 
     // Set up the container launch context for the application master
     /**
-     * add by kongs.
      * 设置用来启动AppMaster的ContainerLaunchContext
      * localResources:appMasterJarPath；log4jPath；shellCommandPath；shellArgsPath;
      * env:shell脚本在hdfs中的信息；AppMaster.jar的CLASSPATH信息
@@ -812,13 +777,11 @@ public class Client {
     }
 
     /**
-     * add by kongs.2015/05/04
      * 这个container只是启动AppMaster使用的
      */
     appContext.setAMContainerSpec(amContainer);
 
     /**
-     * add by kongs.2015/05/04
      * 设置AppMaster的优先级
      */
     // Set the priority for the application master
@@ -883,9 +846,9 @@ public class Client {
           + ", appTrackingUrl=" + report.getTrackingUrl()
           + ", appUser=" + report.getUser());
 
-      //add by kongs. 得到application的运行状态
+      // 得到application的运行状态
       YarnApplicationState state = report.getYarnApplicationState();
-      //add by kongs. 得到application的最终状态
+      // 得到application的最终状态
       FinalApplicationStatus dsStatus = report.getFinalApplicationStatus();
       if (YarnApplicationState.FINISHED == state) {
         if (FinalApplicationStatus.SUCCEEDED == dsStatus) {
@@ -908,7 +871,6 @@ public class Client {
       }			
 
       /**
-       * add by kongs. 2015/05/04
        * 超过10min，就把AppMaster杀死
        * TODO - 删除这个功能，是不是就实现了AppMaster的long running？
        */
@@ -922,7 +884,6 @@ public class Client {
   }
 
   /**
-   * add by kongs. 2051/05/04
    * 可以删除指定的AppMaster.
    * TODO - 保留这个功能，iVIC5.0中，当用户没有相应业务，并且很久没有登陆，是不是就可以杀掉该用户对应的AppMaster以节省资源？
    * TODO - 方法体中提到，要验证是不是多个job可以同时提交到同一个AppMaster.但在iVIC5.0中，job是一个队列，按顺序处理，还是多线程？？？

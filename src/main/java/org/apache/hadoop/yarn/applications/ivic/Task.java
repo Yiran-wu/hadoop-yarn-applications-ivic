@@ -14,6 +14,7 @@ public class Task {
 	private String operation = null;
 	private String soapMethod = null;
 	private String soapArgs = null;
+	private String shellArgs = null;
 	private String createdTime;
 	private int memory = 10;
 	private int vcpu = 1;
@@ -95,6 +96,12 @@ public class Task {
     }
     public void setSoapArgs(String soapArgs) {
         this.soapArgs = soapArgs;
+    }
+    public String getShellArgs() {
+        return shellArgs;
+    }
+    public void setShellArgs(String shellArgs) {
+        this.shellArgs = shellArgs;
     }
     public String getCreatedTime() {
         return createdTime;
