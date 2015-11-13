@@ -178,7 +178,7 @@ public class Client {
   private long clientTimeout = 600000;
 
   // flag to indicate whether to keep containers across application attempts.
-  //add by kongs. 啥意思？？标志是否根据App的请求来保存container？？
+  // 啥意思？？标志是否根据App的请求来保存container？？
   private boolean keepContainers = false;
 
   private long attemptFailuresValidityInterval = -1;
@@ -224,7 +224,7 @@ public class Client {
       LOG.info("Initializing Client");
       try {
     	LOG.info("开始执行init方法！");
-        boolean doRun = client.init(args);//add by kongs. 初始化就是解析命令行参数
+        boolean doRun = client.init(args);//初始化，解析命令行参数
         LOG.info("init方法执行完毕！");
         if (!doRun) {
           System.exit(0);
@@ -252,28 +252,26 @@ public class Client {
    */
   public Client(Configuration conf) throws Exception  {
     this(
-      "org.apache.hadoop.yarn.applications.distributedshell.ApplicationMaster",
+      "org.apache.hadoop.yarn.applications.ivic.ApplicationMaster",
       conf);
     LOG.info("初始化二：Client(Configuration conf)");
   }
 
   /**
-   * add by kongs.
-   * appMasterMainClass:org.apache.hadoop.yarn.applications.distributedshell.ApplicationMaster
+   * appMasterMainClass:org.apache.hadoop.yarn.applications.ivic.ApplicationMaster
    * conf是<code>YarnConfiguration<code>的对象，表示yarn的一些配置信息
    */
   Client(String appMasterMainClass, Configuration conf) {
 	LOG.info("**********初始化命令行！");
     this.conf = conf;
     this.appMasterMainClass = appMasterMainClass;
-    yarnClient = YarnClient.createYarnClient();//add by kongs.创建一个client
+    yarnClient = YarnClient.createYarnClient();
     yarnClient.init(conf);
     opts = new Options();
     LOG.info("**********准备*********");
     //add portal user's id
-    opts.addOption("user_id", true, "user id.");
-    LOG.info("**********添加ivic_job等参数*********");
-    opts.addOption("appname", true, "Application Name. Default value - DistributedShell");
+    opts.addOption("user_id", true, "the current user's id.");
+    opts.addOption("appname", true, "Application Name. Default value - ivic");
     opts.addOption("priority", true, "Application Priority. Default 0");
     opts.addOption("queue", true, "RM Queue in which this application is to be submitted");
     opts.addOption("timeout", true, "Application timeout in milliseconds");
@@ -321,7 +319,7 @@ public class Client {
             + " will be allocated, \"\" means containers"
             + " can be allocated anywhere, if you don't specify the option,"
             + " default node_label_expression of queue will be used.");
-    LOG.info("**********添加参数完成！！！！*********");
+    LOG.info("**********YarnClient初始化完成！！！！*********");
   }
 
   /**
@@ -375,7 +373,8 @@ public class Client {
       keepContainers = true;
     }
 
-    appName = cliParser.getOptionValue("appname", "DistributedShell");
+    // ....
+    appName = cliParser.getOptionValue("appname", "ivic");
     amPriority = Integer.parseInt(cliParser.getOptionValue("priority", "0"));
     amQueue = cliParser.getOptionValue("queue", "default");
     amMemory = Integer.parseInt(cliParser.getOptionValue("master_memory", "10"));		
@@ -397,9 +396,14 @@ public class Client {
     appMasterJar = cliParser.getOptionValue("jar");
 
     /**
-     * 在iVIC5.0中，user第一次提交job时，portal提交distributedshell任务，启动AppMaster，然后自动执行job[一般会将一个job分解为多个task]
+     * 在iVIC5.0中，user第一次提交job时，portal提交ivic任务，启动AppMaster，然后自动执行job[一般会将一个job分解为多个task]
      * portal执行RPC调用，传入job信息【应该是一个xml文件或者map结构体，里面保存分解job需要的信息】；
      * 而在DShell-client接收到iVIC参数后，不进行处理，直接通过启动AM命令的参数形式传送给AM
+     */
+    
+    /**
+     * Date：2015-11-02
+     * 对上述描述的更正：user第一次提交job时，只是去启动appMaster。
      */
     /*
      * 2015.05.05 shell_command和shell_script可以为空
@@ -488,7 +492,7 @@ public class Client {
   public boolean run() throws IOException, YarnException {
 
     LOG.info("Running Client");
-    yarnClient.start();//更改状态，启动服务 add by kongs.
+    yarnClient.start();//更改状态，启动服务
 
     /**
      * YarnClusterMetrics represents cluster metrics. 
@@ -506,8 +510,8 @@ public class Client {
       LOG.info("Got node report from ASM for"
           + ", nodeId=" + node.getNodeId() 
           + ", nodeAddress=" + node.getHttpAddress()
-          + ", nodeRackName=" + node.getRackName() //add by kongs. 机架
-          + ", nodeNumContainers=" + node.getNumContainers()); //add by kongs. 分配的container
+          + ", nodeRackName=" + node.getRackName() // 机架
+          + ", nodeNumContainers=" + node.getNumContainers()); // 分配的container数量
     }
 
     QueueInfo queueInfo = yarnClient.getQueueInfo(this.amQueue);
@@ -649,11 +653,11 @@ public class Client {
      * 其实最后还是要把shell script的相关信息添加到AppMaster的env中；
      * 只不过这些信息是shell脚本文件在上传到hdfs后的参数信息，因为AppMaster必须要知道脚本文件的位置才能执行
      */
-    env.put(DSConstants.DISTRIBUTEDSHELLSCRIPTLOCATION, hdfsShellScriptLocation);
-    env.put(DSConstants.DISTRIBUTEDSHELLSCRIPTTIMESTAMP, Long.toString(hdfsShellScriptTimestamp));
-    env.put(DSConstants.DISTRIBUTEDSHELLSCRIPTLEN, Long.toString(hdfsShellScriptLen));
+    env.put(DSConstants.IVICSCRIPTLOCATION, hdfsShellScriptLocation);
+    env.put(DSConstants.IVICSCRIPTTIMESTAMP, Long.toString(hdfsShellScriptTimestamp));
+    env.put(DSConstants.IVICSCRIPTLEN, Long.toString(hdfsShellScriptLen));
     if (domainId != null && domainId.length() > 0) {
-      env.put(DSConstants.DISTRIBUTEDSHELLTIMELINEDOMAIN, domainId);
+      env.put(DSConstants.IVICTIMELINEDOMAIN, domainId);
     }
 
     // Add AppMaster.jar location to classpath 		
@@ -695,12 +699,11 @@ public class Client {
     // Set class name 
     vargs.add(appMasterMainClass);
     // Set params for Application Master
-    // 这是启动task的container的信息，不是AppMaster的
     vargs.add("--container_memory " + String.valueOf(containerMemory));
     vargs.add("--container_vcores " + String.valueOf(containerVirtualCores));
     vargs.add("--num_containers " + String.valueOf(numContainers));
     
-    // 在启动AM的命令中添加user_id
+    // 在启动AM的命令中添加参数user_id
     vargs.add("--user_id " + "\\\"" + String.valueOf(userID) + "\\\"");
     
     if (null != nodeLabelExpression) {
@@ -776,14 +779,10 @@ public class Client {
       amContainer.setTokens(fsTokens);
     }
 
-    /**
-     * 这个container只是启动AppMaster使用的
-     */
+    // 这个container只是启动AppMaster使用的
     appContext.setAMContainerSpec(amContainer);
 
-    /**
-     * 设置AppMaster的优先级
-     */
+    // 设置AppMaster的优先级
     // Set the priority for the application master
     // TODO - what is the range for priority? how to decide? 
     Priority pri = Priority.newInstance(amPriority);
@@ -798,7 +797,7 @@ public class Client {
     // or an exception thrown to denote some form of a failure
     LOG.info("Submitting application to ASM");
 
-    //add by kongs. 向RM提交application，返回ApplicationId.
+    //向RM提交application，返回ApplicationId.
     yarnClient.submitApplication(appContext);
 
     // TODO
@@ -871,15 +870,15 @@ public class Client {
       }			
 
       /**
-       * 超过10min，就把AppMaster杀死
-       * TODO - 删除这个功能，是不是就实现了AppMaster的long running？
+       * 超过10min，就把AppMaster杀死；也就是不管作业是否成功都会把AppMaster杀死的
+       * TODO 这里暂时保留，可以不断杀死测试产生的AM；但是在最终环境中，需要注释掉这段代码，保证AM能够长时间运行
        */
       if (System.currentTimeMillis() > (clientStartTime + clientTimeout)) {
         LOG.info("Reached client specified timeout for application. Killing application");
         forceKillApplication(appId);
         return false;
       }
-    }			
+    }
 
   }
 

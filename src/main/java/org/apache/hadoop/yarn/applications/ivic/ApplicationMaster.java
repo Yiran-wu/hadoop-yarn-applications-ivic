@@ -44,11 +44,14 @@ import java.util.Vector;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import javax.xml.parsers.DocumentBuilder;
 import javax.xml.parsers.DocumentBuilderFactory;
+import javax.xml.transform.OutputKeys;
 import javax.xml.transform.Transformer;
 import javax.xml.transform.TransformerFactory;
 import javax.xml.transform.dom.DOMSource;
@@ -138,15 +141,14 @@ import com.google.common.collect.Tables;
  * with the <code>ResourceManager</code>. The registration sets up information
  * within the <code>ResourceManager</code> regarding what host:port the
  * ApplicationMaster is listening on to provide any form of functionality to a
- * client as well as a tracking url that a client can use to keep track of
- * status/job history if needed. However, in the distributedshell, trackingurl
+ * client as well as a tracking URL that a client can use to keep track of
+ * status/job history if needed. However, in the ivic, tracking URL
  * and appMasterHost:appMasterRpcPort are not supported.
  * </p>
  *
- *add by kongs:以上这段是说，AppMaster将自己所在的ip:port注册在RM中，然后提供给client一个tracking url
- *以方便client追踪job的status和history
- *但是在distirbutedshell中，tracking url和appMasterHost:appMasterRpcPort并不支持，需要自己实现
- *TODO - 在ivic5.0中，将AppMaster启动后，自动将ip:port反馈给portal对应的user,并保存在DB中，以便用户后续访问
+ * AppMaster将自己所在的ip:port注册在RM中，然后提供给client一个tracking url,以方便client追踪job的status和history
+ * 但是在distirbutedshell中，tracking url和appMasterHost:appMasterRpcPort并不支持，需要自己实现
+ * TODO - 在ivic5.0中，将AppMaster启动后，自动将ip:port反馈给portal对应的user,并保存在DB中，以便用户后续访问
  *
  * <p>
  * The <code>ApplicationMaster</code> needs to send a heartbeat to the
@@ -155,7 +157,7 @@ import com.google.common.collect.Tables;
  * {@link ApplicationMasterProtocol#allocate} to the <code>ResourceManager</code> from the
  * <code>ApplicationMaster</code> acts as a heartbeat.
  *
- *add by kongs:AM定时向RM发送心跳信息，ApplicationMasterProtocol#allocate方法心跳执行
+ * AM定时向RM发送心跳信息，ApplicationMasterProtocol#allocate方法心跳执行
  *
  * <p>
  * For the actual handling of the job, the <code>ApplicationMaster</code> has to
@@ -178,7 +180,7 @@ import com.google.common.collect.Tables;
  * </p>
  * 
  * 对于分配的container,AM都建立ContainerLaunchContext对象（id/loacal resource等），
- * 然后向ContainerManagementProtocol提交StartContainerRequest，在container中执行命令
+ * 然后通过ContainerManagementProtocol提交StartContainerRequest，在container中执行命令
  * 
  * <p>
  * The <code>ApplicationMaster</code> can monitor the launched container by
@@ -187,8 +189,8 @@ import com.google.common.collect.Tables;
  * the {@link ContainerManagementProtocol} by querying for the status of the allocated
  * container's {@link ContainerId}.
  *
- *AM通过两种方式monitor container:(1)使用ApplicationMasterProtocol#allocate查询RM，得到completed container
- *(2)通过ContainerManagementProtocol根据分配的container's id查询状态
+ * AM通过两种方式monitor container:(1)使用ApplicationMasterProtocol#allocate查询RM，得到completed container
+ * (2)通过ContainerManagementProtocol根据分配的container's id查询状态
  *
  * <p>
  * After the job has been completed, the <code>ApplicationMaster</code> has to
@@ -342,8 +344,16 @@ public class ApplicationMaster {
   private Map<String, String> vmMethodMapping = new HashMap<String, String>();
  
   // 保存task的队列
-  // BlockingQueue是一个阻塞队列
+  // BlockingQueue是一个阻塞队列，可以自动进行同步，LinkedBlockingQueue默认大小为Integer.MAX_VALUE，也可手动指定大小
   BlockingQueue<Task> taskQueue = new LinkedBlockingQueue<Task>();
+  
+  // 暂存处理中的task
+  // 此时AM已经为该task发送了资源请求，但是后续还没有执行；等得到container并执行完以后，根据task的内容，去更改相应对象的状态
+  // 多线程情况下，task和container都是FIFO的模式，所以可以保证一一对应
+  static BlockingQueue<Task> pendingTaskQueue = new LinkedBlockingQueue<Task>();
+  
+  // 创建数据库连接，一个appMaster对应一个数据库连接
+  ConnectDataBase con = new ConnectDataBase();
   
   /**
    * @param args Command line args
@@ -497,7 +507,7 @@ public class ApplicationMaster {
         + ", attemptId=" + appAttemptID.getAttemptId());
     
     if (!fileExist(shellCommandPath)
-        && envs.get(DSConstants.DISTRIBUTEDSHELLSCRIPTLOCATION).isEmpty()) {
+        && envs.get(DSConstants.IVICSCRIPTLOCATION).isEmpty()) {
       throw new IllegalArgumentException(
           "No shell command or shell script specified to be executed by application master");
     }
@@ -528,16 +538,16 @@ public class ApplicationMaster {
       }
     }
 
-    if (envs.containsKey(DSConstants.DISTRIBUTEDSHELLSCRIPTLOCATION)) {
-      scriptPath = envs.get(DSConstants.DISTRIBUTEDSHELLSCRIPTLOCATION);
+    if (envs.containsKey(DSConstants.IVICSCRIPTLOCATION)) {
+      scriptPath = envs.get(DSConstants.IVICSCRIPTLOCATION);
 
-      if (envs.containsKey(DSConstants.DISTRIBUTEDSHELLSCRIPTTIMESTAMP)) {
+      if (envs.containsKey(DSConstants.IVICSCRIPTTIMESTAMP)) {
         shellScriptPathTimestamp = Long.valueOf(envs
-            .get(DSConstants.DISTRIBUTEDSHELLSCRIPTTIMESTAMP));
+            .get(DSConstants.IVICSCRIPTTIMESTAMP));
       }
-      if (envs.containsKey(DSConstants.DISTRIBUTEDSHELLSCRIPTLEN)) {
+      if (envs.containsKey(DSConstants.IVICSCRIPTLEN)) {
         shellScriptPathLen = Long.valueOf(envs
-            .get(DSConstants.DISTRIBUTEDSHELLSCRIPTLEN));
+            .get(DSConstants.IVICSCRIPTLEN));
       }
       if (!scriptPath.isEmpty()
           && (shellScriptPathTimestamp <= 0 || shellScriptPathLen <= 0)) {
@@ -549,8 +559,8 @@ public class ApplicationMaster {
       }
     }
 
-    if (envs.containsKey(DSConstants.DISTRIBUTEDSHELLTIMELINEDOMAIN)) {
-      domainId = envs.get(DSConstants.DISTRIBUTEDSHELLTIMELINEDOMAIN);
+    if (envs.containsKey(DSConstants.IVICTIMELINEDOMAIN)) {
+      domainId = envs.get(DSConstants.IVICTIMELINEDOMAIN);
     }
 
     // 以下三项如果为空，则采用默认值
@@ -562,15 +572,18 @@ public class ApplicationMaster {
         "num_containers", "1"));
     if (numTotalContainers == 0) {
       throw new IllegalArgumentException(
-          "Cannot run distributed shell with no containers");
+          "Cannot run ivic with no containers");
     }
     requestPriority = Integer.parseInt(cliParser
         .getOptionValue("priority", "0"));
 
+    // 数据库表和task操作对象的对应关系
     tables.put("VirtualMachine", "virtual_machines");
     tables.put("Vdisk", "vdisks");
     tables.put("Vnet", "vnets");
+    LOG.info("*********db tables:" + tables.toString());
     
+    // task的操作状态的变更
     operationToState.put("deploy", "deploying");
     operationToState.put("start", "starting");
     operationToState.put("stop", "stopping");
@@ -579,12 +592,15 @@ public class ApplicationMaster {
     operationToState.put("resume", "resuming");
     operationToState.put("reboot", "rebooting");
     operationToState.put("edit", "editing");
+    LOG.info("*********operationToState:" + operationToState.toString());
     
+    // VM的操作方法
     vmMethodMapping.put("deploy", "deployVM");
     vmMethodMapping.put("start", "startVM");
     vmMethodMapping.put("stop", "stopVM");
     vmMethodMapping.put("undeploy", "undeployVM");
     vmMethodMapping.put("edit", "deployVMInfo");
+    LOG.info("*********vmMethodMapping:" + vmMethodMapping.toString());
     
     // Creating the Timeline Client
     timelineClient = TimelineClient.createTimelineClient();
@@ -677,85 +693,42 @@ public class ApplicationMaster {
     LOG.info("Max vcores capabililty of resources in this cluster " + maxVCores);
     
     // AppMaster循环访问数据库，while(true)
-    ConnectDataBase con = new ConnectDataBase();
+    // ConnectDataBase con = new ConnectDataBase();
     
     String sql = "update users set app_master_hostname = '" + appMasterHostname + "' where id = " + userID;
     con.executeUpdate(sql);
-    LOG.info("update appMaster hostname in portal database!");
+    LOG.info("******update appMaster hostname in portal database: " + sql);
     
+    LOG.info("******Begin to create a thread to read task!");
     // 暂时创建一个读线程
-    Runnable r = new TaskRunner(taskQueue);
-    Thread thread = new Thread(r);
-    thread.start();
+    // TODO 问题：在初始化这个线程时，传入的taskQueue是空的，那以后如果通过其他线程往里添加东西，是更新之后的taskQueue呢？还是初始化时的taskQueue呢？
     
-    doLoop(con);
+    /*
+    LOG.info("创建生产者进程！");
+    Runnable jobReader = new LoopJobReader();
+    Thread producer = new Thread(jobReader);
+    producer.start();
+    
+    LOG.info("创建消费者进程！");
+    Runnable taskRunner = new TaskRunner();
+    Thread consumer = new Thread(taskRunner);
+    consumer.start();
+    */
+    
+    ExecutorService service = Executors.newCachedThreadPool();
+    // 轮询数据库的线程
+    LoopJobReader producer = new LoopJobReader();
+    // 读取job并解析执行任务的线程
+    TaskRunner consumer = new TaskRunner();
+    LOG.info("创建生产者进程！");
+    service.submit(producer);
+    LOG.info("创建消费者进程！");
+    service.submit(consumer);
+    
+    //doLoop(con);
   }
   
-  private void doLoop(ConnectDataBase con) throws SQLException {
-      ResultSet rs = null;
-      //String jobId;
-      String sql;
-      while (true) {
-          // step1. find out timeout tasks and update the status
-          // TODO 需不需要在数据库中保存task信息？ 需不需要设置时间间隔？是不是看container的执行结果就行？container会不会一直处于运行
-          // TODO 查询语句可以进行优化
-          sql = "select * from tasks where status = 'scheduling'";
-          rs = con.executeQuery(sql);
-          try {
-              while (rs.next()) {
-                  Date now = new Date();
-                  Date date = rs.getDate("updated_at");
-                  long timeInterval = now.getTime() - date.getTime();
-                  if (timeInterval >= 20 * 60 * 1000) { //最大时间间隔为20min
-                      List<String> sqlList = new ArrayList<String>();
-                      sql = "update tasks set status = 'failed', task_info = 'pending or scheduling time out' where id = " + rs.getString("id");
-                      LOG.info(sql);
-                      sqlList.add(sql);
-                      if (rs.getString("target_object_type") != null) {
-                          sql = "update " + tables.get(rs.getString("target_object_type")) + " set status = 'error' where id = " + rs.getString("target_object_id");
-                          sqlList.add(sql);
-                      }
-                      con.executeUpdates(sqlList);
-                      LOG.info("execute update success!");
-                  }
-              }
-          } catch (SQLException e) {
-              LOG.info("execute update failed!");
-              e.printStackTrace();
-          }
-
-          // step2. schedule the pending jobs
-          sql = "select * from jobs where status = 'pending' and user_id = " + userID;
-          rs = con.executeQuery(sql);
-          try {
-              while (rs.next()) {
-                  //jobId = rs.getString(0);
-                  // TODO 将job分解为多个task,并将task放入队列;构建一个task队列和一个failed task的hashmap，相同的failed的job id的task至保存一个即可
-                  TaskGenerator(con, rs);
-
-                  // TODO 存在通过改ResultSet来更改数据库记录的方法
-                  // 如果有将task保存下来的功能则存在中间状态转换，但是如果将job解析完成后直接请求container执行咋办？   
-                  //sql = "update jobs set status = 'scheduling' where id = " + jobId;
-                  //con.executeUpdate(sql);
-                  //LOG.info("update jobs status success!");
-              }
-          }
-          catch (SQLException e) {
-              // TODO 原vshecd中将job.status=error
-              LOG.info("update jobs status failed!");
-              e.printStackTrace();
-          }
-		  
-		  // TODO 这一步在task状态执行完后，由执行结果修改job和vm的状态
-		  // step3.update status of finished jobs
-		  
-		  // TODO 这一步和多线程有关，现在只实现单线程
-          // step5. handle the pending tasks
-		  
-          // step6. sleep for 1 sec
-          // sleep(1);
-	  }
-  }
+  
 
   @VisibleForTesting
   NMCallbackHandler createNMCallbackHandler() {
@@ -815,19 +788,25 @@ public class ApplicationMaster {
       LOG.error("Failed to unregister application", e);
     }
     
+    // AM与RM通讯的句柄关闭
     amRMClient.stop();
 
     return success;
   }
   
+  // 保存vm和container的id对应关系，以便在container执行后更改vm的状态
+  // 目前task的类型只有vm和vdisk，后续的网络和磁盘单独考虑；而在vm和vdisk中，只有vm有状态
+  static ConcurrentHashMap<String, ContainerId> vmToContainer= new ConcurrentHashMap<String, ContainerId>();
+  
   // 回调类，被RM调用通知AM
   private class RMCallbackHandler implements AMRMClientAsync.CallbackHandler {
-    @SuppressWarnings("unchecked")
-    @Override
     /**
      * 检查已完成的 Container 的数量是否达到了需求，没有的话，继续添加需求。
      * 调用时机：RM的心跳应答中包含完成的container信息
+     * TODO 现在的iVIC中，默认一个job对应一个task对应一个container，后续如果加入其他的网络等信息则需要再生成其他task
      */
+    @SuppressWarnings("unchecked")
+    @Override
     public void onContainersCompleted(List<ContainerStatus> completedContainers) {
       LOG.info("Got response from RM for container ask, completedCnt="
           + completedContainers.size());
@@ -870,7 +849,6 @@ public class ApplicationMaster {
       }
       
       /**
-       * 2015.05.05
        * 如果container执行失败，重新执行？？？
        */
       // ask for more containers if any failed
@@ -891,13 +869,14 @@ public class ApplicationMaster {
 
     /**
      * 这是被RM调用的回调类中的回调方法，RM分配了新的container，就调用该方法，开始让AM与NM通信
-     * 
      * 获得新申请的 Container ，创建一个新线程，设置 ContainerLaunchContext，
      * 最终调用 NMClientAsync.startContainerAsync() 来启动 Container.
      * 调用时机：RM为AM返回的心跳应答中包含新分配的container
      * 若心跳应答中同时包含完成的container和新分配的container，则该回调函数在onContainersCompleted之后执行
      * 
-     * 注意：这里是AM和NM真正交互的地方！即，创建新线程，设置container和NMCallbackHandler句柄信息，然后去启动container
+     * 注意：这里是AM和NM开始交互的地方！即，创建新线程，设置container和NMCallbackHandler句柄信息，然后去启动container
+     * 
+     * 在iVIC中，一次暂时只申请一个container，所以即使是list保存container，仍然只有一个
      */
     @Override
     public void onContainersAllocated(List<Container> allocatedContainers) {
@@ -918,6 +897,12 @@ public class ApplicationMaster {
         // + ", containerToken"
         // +allocatedContainer.getContainerToken().getIdentifier().toString());
 
+        // 将vm与为其申请的container的对应关系保存在HashMap中，以便在container执行后用来更改vm的状态
+        Task task = pendingTaskQueue.peek();
+        if (task.getTargetObjectType().equals("VirtualMachine")) {
+            vmToContainer.put(task.getTargetObjectId(), allocatedContainer.getId());
+        }
+        
         LaunchContainerRunnable runnableLaunchContainer =
             new LaunchContainerRunnable(allocatedContainer, containerListener);
         Thread launchThread = new Thread(runnableLaunchContainer);
@@ -969,6 +954,7 @@ public class ApplicationMaster {
       containers.putIfAbsent(containerId, container);
     }
 
+    // 当 NM 停止了一些 Containers 时，会调用改方法，把 Container 列表传给 AM
     @Override
     public void onContainerStopped(ContainerId containerId) {
       if (LOG.isDebugEnabled()) {
@@ -986,15 +972,48 @@ public class ApplicationMaster {
       }
     }
 
+    // 当 NM 新启动了 Containers 时，会调用改方法，把 Container 列表传给AM
     @Override
     public void onContainerStarted(ContainerId containerId,
-        Map<String, ByteBuffer> allServiceResponse) {
+        Map<String, ByteBuffer> allServiceResponse) { // <code>NMClientImpl<code>
       if (LOG.isDebugEnabled()) {
         LOG.debug("Succeeded to start Container " + containerId);
       }
+      
+      /**
+       * 以下是为了更改VM的状态
+       */
       Container container = containers.get(containerId);
       if (container != null) {
         applicationMaster.nmClientAsync.getContainerStatusAsync(containerId, container.getNodeId());
+        Task task;
+        try {
+            task = pendingTaskQueue.take();
+            if (task.getTargetObjectType().equals("VirtualMachine")) {
+                ContainerId containerID = vmToContainer.get(task.getTargetObjectId());
+                // 如果执行完的container就是目前task对应的container，那么就更改vm的状态
+                if (container.getId().equals(containerID)) {
+                    String status = null;
+                    // 在deploy/start/stop时才会发生状态变化
+                    if (task.getOperation().equals("deploy") || task.getOperation().equals("stop")) {
+                        status = "stopped";
+                    }
+                    else if (task.getOperation().equals("start")) {
+                        status = "running";
+                    }
+                    // 不能使用外边的con，原因在于con必须设置为static类型才可以，而这种做法会导致外边的con无法使用
+                    ConnectDataBase conn = new ConnectDataBase();
+                    String sql = "update virtual_machines set status = " + status + " where id = " + task.getTargetObjectId();
+                    LOG.info("更改VirtualMachine的状态： " + sql);
+                    conn.executeUpdate(sql);
+                    conn = null;
+                    //System.gc();
+                }
+            }
+        } catch (InterruptedException e) {
+            // TODO Auto-generated catch block
+            e.printStackTrace();
+        }
       }
       ApplicationMaster.publishContainerStartEvent(
           applicationMaster.timelineClient, container,
@@ -1147,7 +1166,7 @@ public class ApplicationMaster {
        *  					{ scheme: "hdfs" 
        *  						host: "test25" 
        *  						port: 9000 
-       *  						file: "/user/hadoop/DistributedShell/application_1431999596479_0024/ExecScript.sh" 
+       *  						file: "/user/hadoop/ivic/application_1431999596479_0024/ExecScript.sh" 
        *  					} 
        *  					size: 57 
        *  					timestamp: 1433075314903 
@@ -1167,11 +1186,13 @@ public class ApplicationMaster {
       // tokens. We are populating them mainly for NodeManagers to be able to
       // download anyfiles in the distributed file-system. The tokens are
       // otherwise also useful in cases, for e.g., when one is running a
-      // "hadoop dfs" command inside the distributed shell.
+      // "hadoop dfs" command inside the ivic.
       ContainerLaunchContext ctx = ContainerLaunchContext.newInstance(
         localResources, shellEnv, commands, null, allTokens.duplicate(), null);
       // 把要执行的container保存在hashmap中
       containerListener.addContainer(container.getId(), container);
+      
+      // AM与NM通过NMClientAsync通信
       nmClientAsync.startContainerAsync(container, ctx);
     }
   }
@@ -1197,7 +1218,7 @@ public class ApplicationMaster {
    */
   private ContainerRequest setupContainerAskForRM() {
     // setup requirements for hosts
-    // using * as any host will do for the distributed shell app
+    // using * as any host will do for the ivic app
     // set the priority for the request
     // TODO - what is the range for priority? how to decide?
     Priority pri = Priority.newInstance(requestPriority);
@@ -1207,7 +1228,7 @@ public class ApplicationMaster {
     Resource capability = Resource.newInstance(containerMemory,
       containerVirtualCores);
 
-    //2015.05.05 参数列表:Resource capability, String[] nodes, String[] racks, Priority priority
+    // 参数列表:Resource capability, String[] nodes, String[] racks, Priority priority
     ContainerRequest request = new ContainerRequest(capability, null, null,
         pri);
     LOG.info("Requested container ask: " + request.toString());
@@ -1315,6 +1336,59 @@ public class ApplicationMaster {
     }
   }
   
+  //生产者线程，轮询数据库，读取job，然后
+  class LoopJobReader implements Runnable {
+      ResultSet rs = null;
+      String sql;
+      public void run() {
+          LOG.info("开始执行生产者进程！");
+          while (true) {
+              if (con == null) {
+                  con = new ConnectDataBase();
+              }
+              // step1. schedule the pending jobs
+              sql = "select * from jobs where status = 'pending' and user_id = " + userID;
+              LOG.info("读取pendingJob： " + sql);
+              rs = con.executeQuery(sql);
+              try {
+                  while (rs.next()) {
+                      LOG.info("开始分解Job！");
+                      //jobId = rs.getString(0);
+                      // TODO 将job分解为多个task,并将task放入队列;构建一个task队列和一个failed task的hashmap，相同的failed的job id的task至保存一个即可
+                      TaskGenerator(con, rs);
+
+                      // TODO 存在通过改ResultSet来更改数据库记录的方法
+                      // 如果有将task保存下来的功能则存在中间状态转换，但是如果将job解析完成后直接请求container执行咋办？   
+                      //sql = "update jobs set status = 'scheduling' where id = " + jobId;
+                      //con.executeUpdate(sql);
+                      //LOG.info("update jobs status success!");
+                  }
+              }
+              catch (SQLException e) {
+                  // TODO 原vshecd中将job.status=error
+                  // LOG.info("update jobs status failed!");
+                  e.printStackTrace();
+              }
+             
+              // TODO 这一步在task状态执行完后，由执行结果修改job和vm的状态
+              // step2.update status of finished jobs
+             
+              // TODO 这一步和多线程有关，现在只实现单线程
+              // step3. handle the pending tasks
+             
+              // step4. sleep for 1 sec
+              // sleep(1);
+              try {
+                  Thread.currentThread();
+                  Thread.sleep(1000);
+              } catch (InterruptedException e) {
+                  // TODO Auto-generated catch block
+                  e.printStackTrace();
+              }
+          }
+      }
+  }
+  
   /**
    * @param pending状态的job集合
    *   => Vcluster: portal将一个vcluster当成是多个vm的job，循环发送job，还是按多个vm的形式，因为对每个vm，后台都需要vm_setting
@@ -1323,6 +1397,10 @@ public class ApplicationMaster {
    * @throws NumberFormatException 
    */
   private void TaskGenerator(ConnectDataBase con, ResultSet rs) throws NumberFormatException, SQLException {
+      LOG.info("进入TaskGenerator方法中！");
+      if (con == null) {
+          con = new ConnectDataBase();
+      }
 	  LOG.info("[Function generate_tasks] get a new job to handler.");
 	  String jobId = rs.getString("id");
 	  String jobObject = rs.getString("target_object_type");
@@ -1335,6 +1413,7 @@ public class ApplicationMaster {
 	  
 	  // VM has operations: deploy, start, stop, undeploy
 	  if (jobObject.equals("VirtualMachine")) {
+	      LOG.info("*****genVirtaulMachineTask: " + con + "," + jobId + "," + jobOperation + "," + jobObjectId + "," + jobOption);
 	      genVirtaulMachineTask(con, jobId, jobOperation, jobObjectId, jobOption, null);
 	  }
 	  else if (jobObject.equals("Vdisk")) {
@@ -1347,6 +1426,9 @@ public class ApplicationMaster {
   
   // 主要是生成task，保存在数据库和queue中，具体处理等到最后再进行。
   private void genVirtaulMachineTask(ConnectDataBase con, String jobId, String jobOperation, String jobObjectId, String jobOption, String dependingTaskId) throws SQLException {
+      if (con == null) {
+          con = new ConnectDataBase();
+      }
       String vmSetting = null;
       String uuid = null;
       String sql = null;
@@ -1362,7 +1444,8 @@ public class ApplicationMaster {
       
       // deploy和edit时，只是把资源信息写入xml中，并没有真正使用；资源使用发生在虚拟机运行时(start)，所以资源量重新赋值
       if (jobOperation.equals("deploy") || jobOperation.equals("edit") || jobOperation.equals("start")) {
-          sql = "select * from virtual_machines where id = " + jobObjectId;
+          sql = "select id, uuid, hostname, vnc_password, mem_total, vcpu, vm_temp_id, disk_dev_type from virtual_machines where id = " + jobObjectId;
+          LOG.info("******" + sql);
           ResultSet rSet = con.executeQuery(sql);
           while (rSet.next()) {
               uuid = rSet.getString("uuid");
@@ -1385,9 +1468,11 @@ public class ApplicationMaster {
                   //map.put("xml", vmSetting);
               }
           }
+          LOG.info("############ shellArgs: " + shellArgs);
       }
       else if (jobOperation.equals("stop")) { // 如果options为destroy，则shutdown即强制关闭VM;若为NULL，则是正常关闭
           shellArgs = vmMethodMapping.get(jobOperation) + " " + uuid + " " + jobOption;
+          LOG.info("############ shellArgs: " + shellArgs);
           //map.put("stopMode", jobOption);
       }
       else if (jobOperation.equals("undeploy")) { 
@@ -1422,11 +1507,18 @@ public class ApplicationMaster {
       String createdTime = sDateFormat.format(new java.util.Date());
       task.setCreatedTime(createdTime);
       // 将task保存在队列中
-      taskQueue.offer(task);
+      try {
+          taskQueue.put(task); // 队列满，线程阻塞，直到queue有空间再继续
+      } catch (InterruptedException e) {
+          // TODO Auto-generated catch block
+          e.printStackTrace();
+      }
+      //taskQueue.put(task);
       // job.status: pending => scheduling
       sql = "update jobs set status = 'scheduling' where id = " + jobId;
+      LOG.info("****** " + sql);
       con.executeUpdate(sql);
-      LOG.info("update jobs status success!");
+      LOG.info("update jobs status from 'pending' to 'scheduling' success!");
   }
   
   // ****************************************************
@@ -1435,226 +1527,324 @@ public class ApplicationMaster {
   // 2.将xml转换为字符串
   // ****************************************************  
   private static String generateVmSetting(ConnectDataBase con, ResultSet rs) {
-		String xmlStr = null;
-		String sql;
-		ResultSet rSet;
-		DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();
-	    DocumentBuilder builder = null;
-	    try {
-	        builder = dbf.newDocumentBuilder();
-	    } catch (Exception e) {
-	    	e.printStackTrace();
-	    }
-	    Document doc = builder.newDocument();
+      if (con == null) {
+          con = new ConnectDataBase();
+      }
+      String xmlStr = null;
+      String sql;
+      ResultSet rSet;
+      DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();
+      DocumentBuilder builder = null;
+      try {
+          builder = dbf.newDocumentBuilder();
+      } catch (Exception e) {
+          e.printStackTrace();
+      }
+      Document doc = builder.newDocument();
 
-	    Element root = doc.createElement("vNode");
-	    doc.appendChild(root); // 将根元素添加到文档上
+      Element root = doc.createElement("vNode");
+      doc.appendChild(root); // 将根元素添加到文档上
 
-	    try {	      
-		    Element hostName = doc.createElement("Hostname");
-		    hostName.setTextContent(rs.getString("hostname"));
-		    root.appendChild(hostName);
+      try {	      
+          Element hostName = doc.createElement("Hostname");
+          hostName.setTextContent(rs.getString("hostname"));
+          root.appendChild(hostName);
+
+          Element password = doc.createElement("Password");
+          password.setTextContent(rs.getString("vnc_password"));
+          root.appendChild(password);
+
+          Element mem = doc.createElement("Mem");
+          mem.setTextContent(rs.getString("mem_total"));
+          root.appendChild(mem);
+
+          Element vcpu = doc.createElement("vCPU");
+          vcpu.setTextContent(rs.getString("vcpu"));
+          root.appendChild(vcpu);
+          // ******************************************
+          // 以下都是vm_temps表中的信息
+          // ******************************************
+          if (rs.getString("vm_temp_id") != null) {
+              sql = "select url, os_type, os_distribution, os_release, os_kernel, os_packages from vm_temps where id = " + rs.getString("vm_temp_id");
+              System.out.println(sql);
+              ResultSet set = con.executeQuery(sql);
+              while (set.next()) {
+                  Element vTemplateRef = doc.createElement("vTemplateRef");
+                  vTemplateRef.setTextContent(set.getString("url"));
+                  root.appendChild(vTemplateRef);
+			    	  
+                  Element os = doc.createElement("OS");
+                  root.appendChild(os);
+			    	  
+                  Element type = doc.createElement("Type");
+                  type.setTextContent(set.getString("os_type"));
+                  os.appendChild(type);
+			    	  
+                  Element distribution = doc.createElement("Distribution");
+                  distribution.setTextContent(set.getString("os_distribution"));
+                  os.appendChild(distribution);
+			    	  
+                  Element release = doc.createElement("Release");
+                  release.setTextContent(set.getString("os_release"));
+                  os.appendChild(release);
+			    	  
+                  Element kernel = doc.createElement("Kernel");
+                  kernel.setTextContent(set.getString("os_kernel"));
+                  os.appendChild(kernel);
+			    	  
+                  Element packages = doc.createElement("Packages");
+                  packages.setTextContent(set.getString("os_packages"));
+                  os.appendChild(packages);
+              }
+          }
+          else {
+              Element devType = doc.createElement("DevType");
+              devType.setTextContent(rs.getString("disk_dev_type"));
+              root.appendChild(devType);
+          }
 		      
-		    Element password = doc.createElement("Password");
-		    password.setTextContent(rs.getString("vnc_password"));
-		    root.appendChild(password);
-		    
-		    Element mem = doc.createElement("Mem");
-		    mem.setTextContent(rs.getString("mem_total"));
-		    root.appendChild(mem);
-		    
-		    Element vcpu = doc.createElement("vCPU");
-		    vcpu.setTextContent(rs.getString("vcpu"));
-		    root.appendChild(vcpu);
-		    // ******************************************
-		    // 以下都是vm_temps表中的信息
-		    // ******************************************
-		    if (rs.getString("vm_temp_id") != null) {
-		    	sql = "select * from vm_temps where id = " + rs.getString("vm_temp_id");
-		    	System.out.println(sql);
-		    	ResultSet set = con.executeQuery(sql);
-		    	while (set.next()) {
-		    		Element vTemplateRef = doc.createElement("vTemplateRef");
-					vTemplateRef.setTextContent(set.getString("url"));
-					root.appendChild(vTemplateRef);
-			    	  
-			    	Element os = doc.createElement("OS");
-			    	root.appendChild(os);
-			    	  
-			    	Element type = doc.createElement("Type");
-			    	type.setTextContent(set.getString("os_type"));
-			    	os.appendChild(type);
-			    	  
-			    	Element distribution = doc.createElement("Distribution");
-			    	distribution.setTextContent(set.getString("os_distribution"));
-			    	os.appendChild(distribution);
-			    	  
-			    	Element release = doc.createElement("Release");
-			    	release.setTextContent(set.getString("os_release"));
-			    	os.appendChild(release);
-			    	  
-			    	Element kernel = doc.createElement("Kernel");
-			    	kernel.setTextContent(set.getString("os_kernel"));
-			    	os.appendChild(kernel);
-			    	  
-			    	Element packages = doc.createElement("Packages");
-			    	packages.setTextContent(set.getString("os_packages"));
-			    	os.appendChild(packages);
-			    }
-		    }
-		    else {
-		    	Element devType = doc.createElement("DevType");
-		    	devType.setTextContent(rs.getString("disk_dev_type"));
-		    	root.appendChild(devType);
-		    }
-		      
-		    // **************************************************
-		    // 根据vm_id读取vdisks表的信息
-			// TODO 原来需要知道把虚拟机创建的地点，现在应该不需要
-		    // 这里将volume和cdrom类型的vdisk同时取出，并按type和position排序，
-		    // **************************************************
-		    int index = 0;
-		    sql = "select * from vdisks where virtual_machine_id = " + rs.getString("id") + " order by img_type, position";
-			rSet = con.executeQuery(sql);
-			while (rSet.next()) {
-			    Element vdisk = doc.createElement("vDisk");
-			    vdisk.setAttribute("id", "" + index);
-			    root.appendChild(vdisk);
-			      
-				Element uuid = doc.createElement("UUID");
-				uuid.setTextContent(rSet.getString("uuid"));
-				vdisk.appendChild(uuid);
+          // **************************************************
+          // 根据vm_id读取vdisks表的信息
+          // TODO 原来需要知道把虚拟机创建的地点，现在应该不需要
+          // 这里将volume和cdrom类型的vdisk同时取出，并按type和position排序，
+          // **************************************************
+          int index = 0;
+          sql = "select uuid, vdisk_type, img_type, base_id, size from vdisks where virtual_machine_id = " + rs.getString("id") + " order by img_type, position";
+          rSet = con.executeQuery(sql);
+          while (rSet.next()) {
+              Element vdisk = doc.createElement("vDisk");
+              vdisk.setAttribute("id", "\\\'" + index + "\\\'");
+              root.appendChild(vdisk);
+              
+              Element uuid = doc.createElement("UUID");
+              uuid.setTextContent(rSet.getString("uuid"));
+              vdisk.appendChild(uuid);
 				  
-				Element type = doc.createElement("Type");
-				if (rSet.getString("vdisk_type").equals("volumn"))
-					type.setTextContent(rSet.getString("img_type"));
-				else
-					type.setTextContent("cdrom");
-				    vdisk.appendChild(type);
+              Element type = doc.createElement("Type");
+              if (rSet.getString("vdisk_type").equals("volumn"))
+                  type.setTextContent(rSet.getString("img_type"));
+              else
+                  type.setTextContent("cdrom");
+              vdisk.appendChild(type);
 				  
-				// TODO 路径这里先写死！
-				Element path = doc.createElement("Path");
-				if (rSet.getString("vdisk_type").equals("volumn"))
-					path.setTextContent("/var/lib/kongs/" + rSet.getString("uuid") + ".img");
-				else
-					path.setTextContent("/var/lib/kongs/" + rSet.getString("uuid") + ".iso");
-				vdisk.appendChild(path);
+              // TODO 路径这里先写死！
+              Element path = doc.createElement("Path");
+              if (rSet.getString("vdisk_type").equals("volumn"))
+                  path.setTextContent("/var/lib/ivic/vstore/" + rSet.getString("uuid") + ".img");
+              else
+                  path.setTextContent("/var/lib/ivic/vstore/" + rSet.getString("uuid") + ".iso");
+              vdisk.appendChild(path);
 				  
-				if (rs.getString("vm_temp_id") != null && rSet.getString("base_id") != null) {
-					Element basePath = doc.createElement("BasePath");
-					// TODO 在vdisk表中存在base_id，但是需要知道base的uuid，所以，要么重新查询数据库，要么在vdisk表中增加一个字段；先按前者查询
-					sql = "select * from vdisks where id = " + rSet.getString("base_id");
-					ResultSet set = con.executeQuery(sql);
-					while (set.next()) {
-						if (rSet.getString("vdisk_type").equals("volumn"))
-							basePath.setTextContent("/var/lib/kongs/" + set.getString("uuid") + ".img");
-						else
-							basePath.setTextContent("/var/lib/kongs/" + set.getString("uuid") + ".iso");
-					}
-					vdisk.appendChild(basePath);
-				}
+              if (rs.getString("vm_temp_id") != null && rSet.getString("base_id") != null) {
+                  Element basePath = doc.createElement("BasePath");
+                  // TODO 在vdisk表中存在base_id，但是需要知道base的uuid，所以，要么重新查询数据库，要么在vdisk表中增加一个字段；先按前者查询
+                  sql = "select * from vdisks where id = " + rSet.getString("base_id");
+                  ResultSet set = con.executeQuery(sql);
+                  while (set.next()) {
+                      if (rSet.getString("vdisk_type").equals("volumn"))
+                          basePath.setTextContent("/var/lib/ivic/vstore/" + set.getString("uuid") + ".img");
+                      else
+                          basePath.setTextContent("/var/lib/ivic/vstore/" + set.getString("uuid") + ".iso");
+                  }
+                  vdisk.appendChild(basePath);
+              }
 				  
-				if (rSet.getString("img_type").equals("raw") || rSet.getString("img_type").equals("rootfs")) {
-					Element size = doc.createElement("Size");
-					size.setTextContent(rSet.getString("size"));
-					vdisk.appendChild(size);
-				}
-				index++;
-			}
+              if (rSet.getString("img_type").equals("raw") || rSet.getString("img_type").equals("rootfs")) {
+                  Element size = doc.createElement("Size");
+                  size.setTextContent(rSet.getString("size"));
+                  vdisk.appendChild(size);
+              }
+              index++;
+          }
 
-			sql = "select vnics.*, vnets.vswitch_id from vnics, vnets where vnics.virtual_machine_id = " + rs.getString("id") + " and vnics.vnet_id = vnets.id";
-			rSet = con.executeQuery(sql);
-			while (rSet.next()) {
-				Element nic = doc.createElement("NIC");
-			    nic.setAttribute("id", "" + (rSet.getRow() - 1));
-				root.appendChild(nic);
-			      
-				Element mac = doc.createElement("MAC");
-				mac.setTextContent(rSet.getString("mac_address"));
-				nic.appendChild(mac);
-				  
-				Element addr = doc.createElement("Address");
-				addr.setTextContent(rSet.getString("ip_address"));
-				nic.appendChild(addr);
-				  
-				Element netmask = doc.createElement("Netmask");
-				netmask.setTextContent(rSet.getString("netmask"));
-				nic.appendChild(netmask);
-				  
-				Element gateway = doc.createElement("GateWay");
-				gateway.setTextContent(rSet.getString("gateway"));
-				nic.appendChild(gateway);
-				  
-				Element dns = doc.createElement("DNS");
-				dns.setTextContent("8.8.8.8");
-				nic.appendChild(dns);
-				  
-				Element vswitch = doc.createElement("vSwitchRef");
-				if (rSet.getString("vswitch_id") != null) {
-					sql = "select uuid from vswitches where id = " + rSet.getString("vswitch_id");
-					ResultSet set = con.executeQuery(sql);
-					while (set.next()) {
-						vswitch.setTextContent(set.getString(1));
-					}
-				}
-				nic.appendChild(vswitch);
-				  
-				Element type = doc.createElement("vnetType");
-				type.setTextContent(rSet.getString("gateway"));
-				nic.appendChild(type);
-			}
-	    } catch (DOMException e) {
-	    	e.printStackTrace();
-	    } catch (SQLException e) {
-	    	e.printStackTrace();
-	    }
-	      
-	    TransformerFactory  tf  =  TransformerFactory.newInstance();      
-	    Transformer t;
-	    try {
-	    	t = tf.newTransformer();
-			t.setOutputProperty("encoding", "UTF-8");//解决中文问题，试过用GBK不行      
-			ByteArrayOutputStream  bos  =  new  ByteArrayOutputStream();     
-			t.transform(new DOMSource(doc), new StreamResult(bos));      
-			xmlStr = bos.toString();
-			return xmlStr;
-	    } catch (Exception e) {
-	    	e.printStackTrace();
-	    }
-	    
-	    return xmlStr;
-	}
-  
-  // TODO 这里先用单线程实现，后期可以改为多线程
-  public class TaskRunner implements Runnable {
-      private BlockingQueue<Task> queue;
-      //private ConcurrentLinkedQueue<Task> queue1;
-      
-      public TaskRunner(BlockingQueue<Task> queue) {
-          this.queue = queue;
+          sql = "select vnics.*, vnets.vswitch_id from vnics, vnets where vnics.virtual_machine_id = " + rs.getString("id") + " and vnics.vnet_id = vnets.id";
+          rSet = con.executeQuery(sql);
+          while (rSet.next()) {
+              Element nic = doc.createElement("NIC");
+              nic.setAttribute("id", "\\\'" + (rSet.getRow() - 1) + "\\\'");
+              root.appendChild(nic);
+
+              Element mac = doc.createElement("MAC");
+              mac.setTextContent(rSet.getString("mac_address"));
+              nic.appendChild(mac);
+
+              Element addr = doc.createElement("Address");
+              addr.setTextContent(rSet.getString("ip_address"));
+              nic.appendChild(addr);
+
+              Element netmask = doc.createElement("Netmask");
+              netmask.setTextContent(rSet.getString("netmask"));
+              nic.appendChild(netmask);
+              
+              Element gateway = doc.createElement("GateWay");
+              gateway.setTextContent(rSet.getString("gateway"));
+              nic.appendChild(gateway);
+              
+              Element dns = doc.createElement("DNS");
+              dns.setTextContent("8.8.8.8");
+              nic.appendChild(dns);
+              
+              Element vswitch = doc.createElement("vSwitchRef");
+              if (rSet.getString("vswitch_id") != null) {
+                  sql = "select uuid from vswitches where id = " + rSet.getString("vswitch_id");
+                  ResultSet set = con.executeQuery(sql);
+                  while (set.next()) {
+                      vswitch.setTextContent(set.getString(1));
+                  }
+              }
+              nic.appendChild(vswitch);
+              
+              Element type = doc.createElement("vnetType");
+              type.setTextContent(rSet.getString("gateway"));
+              nic.appendChild(type);
+          }
+      } catch (DOMException e) {
+          e.printStackTrace();
+      } catch (SQLException e) {
+          e.printStackTrace();
       }
       
-      ConnectDataBase con = new ConnectDataBase();
+      TransformerFactory tf = TransformerFactory.newInstance();      
+      Transformer t;
+      try {
+          t = tf.newTransformer();
+          t.setOutputProperty("encoding", "UTF-8");//解决中文问题，试过用GBK不行   
+          t.setOutputProperty(OutputKeys.OMIT_XML_DECLARATION, "yes");
+          ByteArrayOutputStream  bos  =  new  ByteArrayOutputStream();     
+          t.transform(new DOMSource(doc), new StreamResult(bos));
+          xmlStr = bos.toString();
+          return xmlStr;
+      } catch (Exception e) {
+          e.printStackTrace();
+      }
+	    
+      return xmlStr;
+  }
+  
+  private void doLoop(ConnectDataBase con) throws SQLException {
+      ResultSet rs = null;
+      //String jobId;
+      String sql;
+      while (true) {
+          if (con == null) {
+              con = new ConnectDataBase();
+          }
+          // step1. find out timeout tasks and update the status
+          // task只在taskQueue中保存，并不保存在portal的数据库中
+          // TODO 需不需要在数据库中保存task信息？ 需不需要设置时间间隔？是不是看container的执行结果就行？container会不会一直处于运行
+          /*
+          sql = "select id, target_object_id, target_object_type, updated_at from tasks where status = 'scheduling'";
+          rs = con.executeQuery(sql);
+          try {
+              while (rs.next()) {
+                  Date now = new Date();
+                  Date date = rs.getDate("updated_at");
+                  long timeInterval = now.getTime() - date.getTime();
+                  if (timeInterval >= 20 * 60 * 1000) { //最大时间间隔为20min
+                      List<String> sqlList = new ArrayList<String>();
+                      sql = "update tasks set status = 'failed', task_info = 'pending or scheduling time out' where id = " + rs.getString("id");
+                      LOG.info(sql);
+                      sqlList.add(sql);
+                      if (rs.getString("target_object_type") != null) {
+                          sql = "update " + tables.get(rs.getString("target_object_type")) + " set status = 'error' where id = " + rs.getString("target_object_id");
+                          sqlList.add(sql);
+                      }
+                      con.executeUpdates(sqlList);
+                      LOG.info("execute update success!");
+                  }
+              }
+          } catch (SQLException e) {
+              LOG.info("execute update failed!");
+              e.printStackTrace();
+          }*/
+
+          // step2. schedule the pending jobs
+          sql = "select id, target_object_id, target_object_type, operation, options from jobs where status = 'pending' and user_id = " + userID;
+          rs = con.executeQuery(sql);
+          try {
+              while (rs.next()) {
+                  //jobId = rs.getString(0);
+                  // TODO 将job分解为多个task,并将task放入队列;构建一个task队列和一个failed task的hashmap，相同的failed的job id的task至保存一个即可
+                  TaskGenerator(con, rs);
+
+                  // TODO 存在通过改ResultSet来更改数据库记录的方法
+                  // 如果有将task保存下来的功能则存在中间状态转换，但是如果将job解析完成后直接请求container执行咋办？   
+                  //sql = "update jobs set status = 'scheduling' where id = " + jobId;
+                  //con.executeUpdate(sql);
+                  //LOG.info("update jobs status success!");
+              }
+          }
+          catch (SQLException e) {
+              // TODO 原vshecd中将job.status=error
+              LOG.info("update jobs status failed!");
+              e.printStackTrace();
+          }
+          
+          // TODO 这一步在task状态执行完后，由执行结果修改job和vm的状态
+          // step3.update status of finished jobs
+          
+          // TODO 这一步和多线程有关，现在只实现单线程
+          // step5. handle the pending tasks
+          
+          // step6. sleep for 1 sec
+          // sleep(1);
+          try {
+              Thread.currentThread();
+              Thread.sleep(1000);
+          } catch (InterruptedException e) {
+              // TODO Auto-generated catch block
+              e.printStackTrace();
+          }
+      }
+  }
+  
+  // TODO 这里先用单线程实现，后期可以改为多线程
+  class TaskRunner implements Runnable {
+      // private BlockingQueue<Task> queue;
+      //private ConcurrentLinkedQueue<Task> queue1;
+      
+      //public TaskRunner(BlockingQueue<Task> queue) {
+         // LOG.info("********create TaskRunner!");
+         // this.queue = queue;
+      //}
+      
+      //ConnectDataBase con = new ConnectDataBase();
       String sql;
       public void run() {
+          LOG.info("开始执行TaskRunner.run()!");
+          Task task = null;
           while(true) {
-              if (queue.peek() == null) {
-                  Task task = queue.poll();
+              try {
+                  LOG.info("TaskRunner从队列中读取task");
+                  // 队列为空，线程阻塞进入等待状态，直到有新对象加入为止
+                  task = taskQueue.take();
+                  // 取出要处理的task，然后申请container并将task保存在中间队列pendingTaskQueue中
+                  pendingTaskQueue.put(task);
+                  LOG.info("TaskRunner读取task成功！");
+                  LOG.info("开始执行task！");
                   doTask(task);
+              } catch (InterruptedException e) {
+                  // TODO Auto-generated catch block
+                  e.printStackTrace();
               }
           }
       }
       
       private void doTask(Task task) {
-          // TODO 更新vm/vdisk的状态
+          if (con == null) {
+              con = new ConnectDataBase();
+          }
+          LOG.info("开始执行TaskRunner.doTask()!!");
+          // 更新vm/vdisk的状态，变为执行中的状态
           if (task.getTargetObjectId() != null) {
               sql = "update " + tables.get(task.getTargetObjectType()) + " set status = '" + operationToState.get(task.getOperation()) + "' where id = " + task.getTargetObjectId();
-              LOG.info(sql);
+              LOG.info("更改虚拟机状态:" + sql);
               con.executeUpdate(sql);
           }
           containerMemory = task.getMemory();
           containerVirtualCores = task.getVcpu();
           
+          // TODO 这里对于创建的VM不适用，公有云环境下，尽量保证资源可用，以及所提供最大资源足够大
           // A resource ask cannot exceed the max.
           if (containerMemory > maxMem) {
             LOG.info("Container memory specified above max threshold of cluster."
@@ -1678,6 +1868,7 @@ public class ApplicationMaster {
           // containers
           // Keep looping until all the containers are launched and shell script
           // executed on them ( regardless of success/failure).
+          // 申请资源的时候只和mem/vcpu有关，shell命令的其他内容等得到container后才能用到
           ContainerRequest containerAsk = setupContainerAskForRM();
           extracted(containerAsk);
           

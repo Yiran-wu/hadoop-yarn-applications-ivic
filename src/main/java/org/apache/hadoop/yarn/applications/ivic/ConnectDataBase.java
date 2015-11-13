@@ -4,9 +4,13 @@ import java.io.*;
 import java.sql.*;
 import java.util.*;
 
+import org.apache.commons.logging.Log;
+import org.apache.commons.logging.LogFactory;
+
 public class ConnectDataBase {
+    private static final Log LOG = LogFactory.getLog(ApplicationMaster.class);
 	private static String driver = "com.mysql.jdbc.Driver";
-	private static String url = "jdbc:mysql://localhost:3306/iVIC_Portal_development";
+	private static String url = "jdbc:mysql://192.168.7.57:3306/iVIC_Portal_development";
 	private static String username = "root";
 	private static String password = "123456";
 	private Connection con = null;
@@ -24,8 +28,8 @@ public class ConnectDataBase {
 		}*/
 		try {
 			Class.forName(driver).newInstance();
+			con = DriverManager.getConnection(url, username, password);
 		} catch (Exception e) {
-			System.out.println("数据库驱动加载失败！"); 
 			e.printStackTrace();
 		}
 	}
@@ -36,7 +40,7 @@ public class ConnectDataBase {
 	 * @return Connection
 	 * @throws SQLException
 	 */
-	public Connection getDBConnection() {
+	/*public Connection getDBConnection() {
 		try {
 			con = DriverManager.getConnection(url, username, password);
 		} catch (SQLException e) {
@@ -44,7 +48,7 @@ public class ConnectDataBase {
 		}
 		return con;
 	}
-	
+	*/
 	public static Properties getProperties() {
 		Properties props = new Properties();
 		InputStream in = null ;
@@ -90,16 +94,17 @@ public class ConnectDataBase {
 	 */
 	public ResultSet executeQuery(String sql){
         try{
-        	con = this.getDBConnection();
+        	//con = this.getDBConnection();
         	pstmt = con.prepareStatement(sql);
         	/*
         	if(params != null) {
                 for(int i = 0;i < params.length; i++) {
                     pstmt.setObject(i + 1, params[i]);
-                }                    
+                }
             }*/
-        	rs = pstmt.executeQuery();  
+        	rs = pstmt.executeQuery();
         }catch(Exception e){
+            LOG.info("error: " + e);
         	e.printStackTrace();
         }
         return rs;
@@ -113,7 +118,7 @@ public class ConnectDataBase {
 	 */
 	public void executeUpdate(String sql) { 
         try {
-        	con = this.getDBConnection();
+        	//con = this.getDBConnection();
         	pstmt = con.prepareStatement(sql);
         	pstmt.executeUpdate();  
         }catch(Exception e){
@@ -130,7 +135,7 @@ public class ConnectDataBase {
      */
     public void executeUpdates(List<String> sqlList) { 
         try {
-            con = this.getDBConnection();
+            //con = this.getDBConnection();
             con.setAutoCommit(false);
             for(int i = 0; i < sqlList.size(); i++){
                 pstmt = con.prepareStatement(sqlList.get(i));
