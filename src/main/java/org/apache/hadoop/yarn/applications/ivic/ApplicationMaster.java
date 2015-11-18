@@ -994,17 +994,17 @@ public class ApplicationMaster {
                 // 如果执行完的container就是目前task对应的container，那么就更改vm的状态
                 if (container.getId().equals(containerID)) {
                     String status = null;
+                    String sql = null;
                     // 在deploy/start/stop时才会发生状态变化
                     if (task.getOperation().equals("deploy") || task.getOperation().equals("stop")) {
-                        status = "stopped";
+                        sql = "update virtual_machines set status = 'stopped' where id = " + task.getTargetObjectId();
                     }
                     else if (task.getOperation().equals("start")) {
-                        status = "running";
+                        sql = "update virtual_machines set status = 'running' where id = " + task.getTargetObjectId();
                     }
-                    // 不能使用外边的con，原因在于con必须设置为static类型才可以，而这种做法会导致外边的con无法使用
-                    ConnectDataBase conn = new ConnectDataBase();
-                    String sql = "update virtual_machines set status = " + status + " where id = " + task.getTargetObjectId();
                     LOG.info("更改VirtualMachine的状态： " + sql);
+                    // 不能使用外边的con，原因在于con必须设置为static类型才可以，而这种做法会导致外边的con无法使用
+                    ConnectDataBase conn = new ConnectDataBase();                  
                     conn.executeUpdate(sql);
                     conn = null;
                     //System.gc();
@@ -1442,22 +1442,28 @@ public class ApplicationMaster {
       int containerMemory = 10;
       int containerVirtualCores = 1;
       
-      // deploy和edit时，只是把资源信息写入xml中，并没有真正使用；资源使用发生在虚拟机运行时(start)，所以资源量重新赋值
-      if (jobOperation.equals("deploy") || jobOperation.equals("edit") || jobOperation.equals("start")) {
-          sql = "select id, uuid, hostname, vnc_password, mem_total, vcpu, vm_temp_id, disk_dev_type from virtual_machines where id = " + jobObjectId;
-          LOG.info("******" + sql);
-          ResultSet rSet = con.executeQuery(sql);
-          while (rSet.next()) {
-              uuid = rSet.getString("uuid");
+      /**
+       *  deploy和edit时，只是把资源信息写入xml中，并没有真正使用；资源使用发生在虚拟机运行时(start)，所以资源量重新赋值
+       *  所以此处有两种选择，有待考证：
+       *  第一种：原来的思路，deploy和edit时，只需要一个很小的container能够执行命令就行，反正最终container执行完以后都要被回收；只有在start时才分配完整的资源
+       *  第二种：现在的思路：deploy/edit/start时，都按照全部的资源量申请，原因在于，防止后边启动VM后资源不够！但是在deploy/edit后，资源还是会全部被回收；
+       *  对于startVM，启动后container一直运行，只有在VM停止后，container才停止【这也是把AM设计为long-time running的原因！（原来的一个AM往往对应一个job，等）】
+       */
+      sql = "select id, uuid, hostname, vnc_password, mem_total, vcpu, vm_temp_id, disk_dev_type from virtual_machines where id = " + jobObjectId;
+      LOG.info("******" + sql);
+      ResultSet rSet = con.executeQuery(sql);
+      while (rSet.next()) {
+          uuid = rSet.getString("uuid");
+          if (jobOperation.equals("deploy") || jobOperation.equals("start") || jobOperation.equals("edit")) {
               vmSetting = generateVmSetting(con, rSet);
+              // 内存单位为KB，需转换为MB
+              String vmem = rSet.getString("mem_total");
+              String vcpu = rSet.getString("vcpu");
+              LOG.info("*********** vMem: " + vmem);
+              LOG.info("*********** vCPU: " + vcpu);
+              containerMemory = Integer.parseInt(vmem) / 1024;
+              containerVirtualCores = Integer.parseInt(vcpu);
               if (jobOperation.equals("start")) {
-                  // 内存单位为KB，需转换为MB
-                  String vmem = rSet.getString("mem_total");
-                  String vcpu = rSet.getString("vcpu");
-                  LOG.info("*********** vMem: " + vmem);
-                  LOG.info("*********** vCPU: " + vcpu);
-                  containerMemory = Integer.parseInt(vmem) / 1024;
-                  containerVirtualCores = Integer.parseInt(vcpu);
                   // 将执行的方法名、uuid和vm_setting作为执行python函数的参数
                   // 加转义双重的转义字符是因为，最终拼成的命令为：
                   // `exec /bin/bash -c "bash ExecScript.sh deplyVM "uuid-test1" "<vNode>...</vNode>" 1>/xxx/logs/userlogs/application_xxx/container_xxx/stdout 2>/xxx/stderr "'
@@ -1465,27 +1471,26 @@ public class ApplicationMaster {
               }
               else {
                   shellArgs = vmMethodMapping.get(jobOperation) + " \\\"" + uuid + "\\\" \\\"" + vmSetting + "\\\"";
-                  //map.put("xml", vmSetting);
               }
+              LOG.info("############ shellArgs: " + shellArgs);
           }
-          LOG.info("############ shellArgs: " + shellArgs);
-      }
-      else if (jobOperation.equals("stop")) { // 如果options为destroy，则shutdown即强制关闭VM;若为NULL，则是正常关闭
-          shellArgs = vmMethodMapping.get(jobOperation) + " " + uuid + " " + jobOption;
-          LOG.info("############ shellArgs: " + shellArgs);
-          //map.put("stopMode", jobOption);
-      }
-      else if (jobOperation.equals("undeploy")) { 
-          task.setSoapMethod("undeployVM");
-          // 数据库中的option字段为“{“delete_vdisk => yes/no”}”,是一个hash表
-          if (jobOption.split("=>")[1].equals("yes")) {
-              shellArgs = vmMethodMapping.get(jobOperation) + " " + uuid + " yes";
-              //map.put("delete", "yes");
+          else if (jobOperation.equals("stop")) { // 如果options为destroy，则shutdown即强制关闭VM;若为NULL，则是正常关闭
+              shellArgs = vmMethodMapping.get(jobOperation) + " " + uuid + " " + jobOption;
+              LOG.info("############ shellArgs: " + shellArgs);
+              //map.put("stopMode", jobOption);
           }
-          else {
-              shellArgs = vmMethodMapping.get(jobOperation) + " " + uuid;
+          else if (jobOperation.equals("undeploy")) { 
+              task.setSoapMethod("undeployVM");
+              // 数据库中的option字段为“{“delete_vdisk => yes/no”}”,是一个hash表
+              if (jobOption.split("=>")[1].equals("yes")) {
+                  shellArgs = vmMethodMapping.get(jobOperation) + " " + uuid + " yes";
+                  //map.put("delete", "yes");
+              }
+              else {
+                  shellArgs = vmMethodMapping.get(jobOperation) + " " + uuid;
+              }
+              LOG.info("############ shellArgs: " + shellArgs);
           }
-          LOG.info("############ shellArgs: " + shellArgs);
       }
       
       // 生成task对象，保存在队列和数据库中
@@ -1501,7 +1506,7 @@ public class ApplicationMaster {
       //task.setSoapArgs(map.toString());
       task.setShellArgs(shellArgs);
       //task.setStatus(dependingTaskId == null ? "pending" : "waiting");
-      task.setStatus("pending");
+      task.setStatus("pending"); // TODO 似乎没啥用。。
       //task.setTitle(task.getOperation() + " vmi " + task.getTargetObjectId());
       SimpleDateFormat sDateFormat = new SimpleDateFormat("yyyy-MM-dd hh:mm:ss");     
       String createdTime = sDateFormat.format(new java.util.Date());
