@@ -37,6 +37,7 @@ import java.util.ArrayList;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.Iterator;
+import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -207,12 +208,14 @@ public class ApplicationMaster {
 
   private static final Log LOG = LogFactory.getLog(ApplicationMaster.class);
 
+  // 开头的DS我理解为“Distributed shell”
   @VisibleForTesting
   @Private
   public static enum DSEvent {
     DS_APP_ATTEMPT_START, DS_APP_ATTEMPT_END, DS_CONTAINER_START, DS_CONTAINER_END
   }
   
+  // 两个事件实体：appMaster和container
   @VisibleForTesting
   @Private
   public static enum DSEntity {
@@ -233,14 +236,12 @@ public class ApplicationMaster {
   private NMClientAsync nmClientAsync;
   // Listen to process the response from the Node Manager
   private NMCallbackHandler containerListener;
-  
   // Application Attempt Id ( combination of attemptId and fail count )
   @VisibleForTesting
   protected ApplicationAttemptId appAttemptID;
 
   // TODO
   // For status update for clients - yet to be implemented
-
   // Hostname of the container
   private String appMasterHostname = "";
   // Port on which the app master listens for status updates from clients
@@ -258,8 +259,8 @@ public class ApplicationMaster {
   // Priority of the request
   private int requestPriority;
   
+  // add by kongs. 改为全局变量，并赋一个初始值
   private int maxMem = 512;
-  
   private int maxVCores = 1;
 
   /**
@@ -269,6 +270,7 @@ public class ApplicationMaster {
    * numRequestedContainers:AM已经请求的container的数量（container只能请求一次，除非原始的request信息变更！）
    * 所以：
    * numRequestedContainers - numAllocatedContainers = 已经申请但是还未分配的container数量
+   * numCompletedContainers - numFailedContainers = 执行成功的container数量
    * 
    */
   // Counter for completed containers ( complete denotes successful or failed )
@@ -300,11 +302,13 @@ public class ApplicationMaster {
   // File length needed for local resource
   private long shellScriptPathLen = 0;
 
+  // 简单说就是记录历史信息的
   // Timeline domain ID
   private String domainId = null;
 
   // Hardcoded path to shell script in launch container's local env
   // Hardcoded path：硬编码，应该指静态变量
+  // 直接通过Client类调用静态final变量
   private static final String ExecShellStringPath = Client.SCRIPT_PATH + ".sh";
   private static final String ExecBatScripStringtPath = Client.SCRIPT_PATH
       + ".bat";
@@ -318,14 +322,18 @@ public class ApplicationMaster {
   // ivic job在hdfs上的路径
   //private static final String ivicJobPath = "ivicJob";
 
+  // AM是否执行完成
   private volatile boolean done;
 
+  // TODO 令牌，咱没有搞清具体流程
   private ByteBuffer allTokens;
 
   // Launch threads
+  // 保存要执行container的线程
   private List<Thread> launchThreads = new ArrayList<Thread>();
 
   // Timeline Client
+  // 和Timeline Server通讯，记录history
   private TimelineClient timelineClient;
 
   private final String linux_bash_command = "bash";
@@ -335,6 +343,7 @@ public class ApplicationMaster {
   private static String userID = null;
 
   // get table name from task and job's target_object_type
+  // TODO 这里暂时只用到vm
   private Map<String, String> tables = new HashMap<String, String>();
   // operationToState is for update the tasks' object during operations
   private Map<String, String> operationToState = new HashMap<String, String>();
@@ -352,13 +361,19 @@ public class ApplicationMaster {
   // 多线程情况下，task和container都是FIFO的模式，所以可以保证一一对应
   static BlockingQueue<Task> pendingTaskQueue = new LinkedBlockingQueue<Task>();
   
+  // 保存vm和container对应关系，以便在container执行后更改vm的状态
+  // 目前task的类型只有vm和vdisk，后续的网络和磁盘单独考虑；而在vm和vdisk中，只有vm有状态
+  static ConcurrentHashMap<String, ContainerId> vmToContainer= new ConcurrentHashMap<String, ContainerId>();
+  
   // 创建数据库连接，一个appMaster对应一个数据库连接
+  // TODO 后续可以加入portal与AM的RPC通讯
   ConnectDataBase con = new ConnectDataBase();
   
   /**
    * @param args Command line args
    */
   public static void main(String[] args) {
+    // TODO 这里将result注释掉，并且不退出，应该可以实现AM的long-running
     boolean result = false;
     try {
       ApplicationMaster appMaster = new ApplicationMaster();
@@ -368,6 +383,10 @@ public class ApplicationMaster {
         System.exit(0);
       }
       appMaster.run();
+      /*
+       * Date: 2015/11/19
+       * 如果AM一直运行，则result永远得不到结果，除非因为异常退出
+       */
       result = appMaster.finish();
     } catch (Throwable t) {
       LOG.fatal("Error running ApplicationMaster", t);
@@ -457,7 +476,7 @@ public class ApplicationMaster {
     }
     
     userID = cliParser.getOptionValue("user_id");
-    LOG.info("***********get user id from client: " + userID);
+    LOG.info("【470】Get user id from client: " + userID);
 
     if (cliParser.hasOption("help")) {
       printUsage(opts);
@@ -564,16 +583,19 @@ public class ApplicationMaster {
     }
 
     // 以下三项如果为空，则采用默认值
-    containerMemory = Integer.parseInt(cliParser.getOptionValue(
-        "container_memory", "10"));
-    containerVirtualCores = Integer.parseInt(cliParser.getOptionValue(
-        "container_vcores", "1"));
-    numTotalContainers = Integer.parseInt(cliParser.getOptionValue(
-        "num_containers", "1"));
+    containerMemory = Integer.parseInt(cliParser.getOptionValue("container_memory", "10"));
+    containerVirtualCores = Integer.parseInt(cliParser.getOptionValue("container_vcores", "1"));
+    
+    
+    numTotalContainers = Integer.parseInt(cliParser.getOptionValue("num_containers", "1"));
+    // modify by kongs. 11-19
+    // 现在即使没有container的数量可以为0，继续等待下一个请求
+    /*
     if (numTotalContainers == 0) {
       throw new IllegalArgumentException(
           "Cannot run ivic with no containers");
-    }
+    }*/
+    
     requestPriority = Integer.parseInt(cliParser
         .getOptionValue("priority", "0"));
 
@@ -655,11 +677,12 @@ public class ApplicationMaster {
         UserGroupInformation.createRemoteUser(appSubmitterUserName);
     appSubmitterUgi.addCredentials(credentials);
 
+    // 发布AppMaster启动的事件
     publishApplicationAttemptEvent(timelineClient, appAttemptID.toString(),
         DSEvent.DS_APP_ATTEMPT_START, domainId, appSubmitterUgi);
 
     AMRMClientAsync.CallbackHandler allocListener = new RMCallbackHandler();
-    amRMClient = AMRMClientAsync.createAMRMClientAsync(1000, allocListener);
+    amRMClient = AMRMClientAsync.createAMRMClientAsync(1000, allocListener); // 心跳周期1000ms
     amRMClient.init(conf);
     amRMClient.start();//主要更改状态
 
@@ -676,16 +699,18 @@ public class ApplicationMaster {
     
     // TODO use the rpc port info to register with the RM for the client to
     // send requests to this app master
+    // client用AppMaster在RM中注册的rpc port，向AppMaster通讯
 
     // Register self with ResourceManager
     // This will start heartbeating to the RM
+    // TODO 这里的appMasterRpcPort端口信息直接采用默认值-1，appMasterTrackingUrl也为空串
     appMasterHostname = NetUtils.getHostname();
     RegisterApplicationMasterResponse response = amRMClient
         .registerApplicationMaster(appMasterHostname, appMasterRpcPort,
             appMasterTrackingUrl);
+    
     // Dump out information about cluster capability as seen by the
     // resource manager
-    
     maxMem = response.getMaximumResourceCapability().getMemory();
     LOG.info("Max mem capabililty of resources in this cluster " + maxMem);
     
@@ -699,7 +724,6 @@ public class ApplicationMaster {
     con.executeUpdate(sql);
     LOG.info("******update appMaster hostname in portal database: " + sql);
     
-    LOG.info("******Begin to create a thread to read task!");
     // 暂时创建一个读线程
     // TODO 问题：在初始化这个线程时，传入的taskQueue是空的，那以后如果通过其他线程往里添加东西，是更新之后的taskQueue呢？还是初始化时的taskQueue呢？
     
@@ -728,8 +752,6 @@ public class ApplicationMaster {
     //doLoop(con);
   }
   
-  
-
   @VisibleForTesting
   NMCallbackHandler createNMCallbackHandler() {
     return new NMCallbackHandler(this);
@@ -737,11 +759,19 @@ public class ApplicationMaster {
 
   @VisibleForTesting
   protected boolean finish() {
-    // wait for completion.
-    while (!done
-        && (numCompletedContainers.get() != numTotalContainers)) {
+    /**
+     * Date:2015/11/19
+     * wait for completion.
+     * 轮询检查AM最终是否完成；
+     * 现在没有numTotalContainers(一开始预设的要执行container的数量，现在可以为0)的概念，只有numCompletedContainers，
+     * 所以，在退出AM时，只根据done的值退出
+     */
+     
+    //while (!done && (numCompletedContainers.get() != numTotalContainers)) {
+    while (!done) {
       try {
-        Thread.sleep(200);
+        // 原来值为200，现在AM为long-running，所以没必要那么频繁检查
+        Thread.sleep(2000);
       } catch (InterruptedException ex) {}
     }
 
@@ -758,6 +788,7 @@ public class ApplicationMaster {
     }
 
     // When the application completes, it should stop all running containers
+    // TODO 在AM退出时，running的container不应该收到影响
     LOG.info("Application completed. Stopping running containers");
     nmClientAsync.stop();
 
@@ -765,10 +796,15 @@ public class ApplicationMaster {
     // signal to the RM
     LOG.info("Application completed. Signalling finish to RM");
 
+    /**
+     * Date: 2015/11/19
+     * 解释：这里的AM退出分为两种情况：正常（container全部执行完）和异常（container没有执行完而因为其他原因中断）
+     * 现在：只有异常退出，所以把success直接置为false
+     */
     FinalApplicationStatus appStatus;
     String appMessage = null;
     boolean success = true;
-    if (numFailedContainers.get() == 0 && 
+    /*if (numFailedContainers.get() == 0 && 
         numCompletedContainers.get() == numTotalContainers) { //执行成功
       appStatus = FinalApplicationStatus.SUCCEEDED;
     } else { //执行失败
@@ -779,7 +815,14 @@ public class ApplicationMaster {
           + numFailedContainers.get();
       LOG.info(appMessage);
       success = false;
-    }
+    }*/
+    appStatus = FinalApplicationStatus.FAILED;
+    appMessage = "Diagnostics." + ", total=" + numTotalContainers
+        + ", completed=" + numCompletedContainers.get() + ", allocated="
+        + numAllocatedContainers.get() + ", failed="
+        + numFailedContainers.get();
+    LOG.info(appMessage);
+    success = false;
     try { //无论成功与否，都将AM在RM的注册信息删除掉
       amRMClient.unregisterApplicationMaster(appStatus, appMessage, null);
     } catch (YarnException ex) {
@@ -794,11 +837,8 @@ public class ApplicationMaster {
     return success;
   }
   
-  // 保存vm和container的id对应关系，以便在container执行后更改vm的状态
-  // 目前task的类型只有vm和vdisk，后续的网络和磁盘单独考虑；而在vm和vdisk中，只有vm有状态
-  static ConcurrentHashMap<String, ContainerId> vmToContainer= new ConcurrentHashMap<String, ContainerId>();
-  
   // 回调类，被RM调用通知AM
+  // 该类中每个方法的含义，查看<code>AMRMClientAsync<code>中的<code>CallbackHandler<code>接口
   private class RMCallbackHandler implements AMRMClientAsync.CallbackHandler {
     /**
      * 检查已完成的 Container 的数量是否达到了需求，没有的话，继续添加需求。
@@ -849,22 +889,28 @@ public class ApplicationMaster {
       }
       
       /**
-       * 如果container执行失败，重新执行？？？
+       * 原来：如果container执行失败，重新执行
+       * 现在：即使container失败也不重新执行，因为这涉及到container的资源量的大小，而每次申请的资源不一定一样
        */
       // ask for more containers if any failed
-      int askCount = numTotalContainers - numRequestedContainers.get();
+      /*int askCount = numTotalContainers - numRequestedContainers.get();
       numRequestedContainers.addAndGet(askCount);
-
       if (askCount > 0) {
         for (int i = 0; i < askCount; ++i) {
           ContainerRequest containerAsk = setupContainerAskForRM();
           amRMClient.addContainerRequest(containerAsk);
         }
-      }
+      }*/
       
-      if (numCompletedContainers.get() == numTotalContainers) {
+      /**
+       * Date：11-19
+       * 原来：完成的container数量等于一开始要请求的container数量，说明执行结束，done=true
+       * 现在：AM为long-running，一开始要请求的container数量可以为0，根据是否有job生成来完成任务执行
+       */
+      // 完成的container数量等于一开始要请求的container数量，则done=true，表示完成！
+      /*if (numCompletedContainers.get() == numTotalContainers) {
         done = true;
-      }
+      }*/
     }
 
     /**
@@ -890,31 +936,46 @@ public class ApplicationMaster {
             + ", containerNode=" + allocatedContainer.getNodeId().getHost()
             + ":" + allocatedContainer.getNodeId().getPort()
             + ", containerNodeURI=" + allocatedContainer.getNodeHttpAddress()
-            + ", containerResourceMemory"
+            + ", containerResourceMemory="
             + allocatedContainer.getResource().getMemory()
-            + ", containerResourceVirtualCores"
-            + allocatedContainer.getResource().getVirtualCores());
-        // + ", containerToken"
-        // +allocatedContainer.getContainerToken().getIdentifier().toString());
+            + ", containerResourceVirtualCores="
+            + allocatedContainer.getResource().getVirtualCores()
+            + ", containerToken"
+            +allocatedContainer.getContainerToken().getIdentifier().toString());
 
         // 将vm与为其申请的container的对应关系保存在HashMap中，以便在container执行后用来更改vm的状态
-        Task task = pendingTaskQueue.peek();
-        if (task.getTargetObjectType().equals("VirtualMachine")) {
-            vmToContainer.put(task.getTargetObjectId(), allocatedContainer.getId());
+        if (!pendingTaskQueue.isEmpty()) {
+            Task task = pendingTaskQueue.peek();
+            
+            if (task.getTargetObjectType().equals("VirtualMachine")) {
+                vmToContainer.put(task.getTargetObjectId(), allocatedContainer.getId());
+            }
+            
+            LaunchContainerRunnable runnableLaunchContainer =
+                new LaunchContainerRunnable(allocatedContainer, containerListener);
+            Thread launchThread = new Thread(runnableLaunchContainer);
+    
+            // launch and start the container on a separate thread to keep
+            // the main thread unblocked
+            // as all containers may not be allocated at one go.
+            launchThreads.add(launchThread);
+            launchThread.start();
         }
-        
-        LaunchContainerRunnable runnableLaunchContainer =
-            new LaunchContainerRunnable(allocatedContainer, containerListener);
-        Thread launchThread = new Thread(runnableLaunchContainer);
-
-        // launch and start the container on a separate thread to keep
-        // the main thread unblocked
-        // as all containers may not be allocated at one go.
-        launchThreads.add(launchThread);
-        launchThread.start();
+        else {
+            amRMClient.releaseAssignedContainer(allocatedContainer.getId());
+        }
       }
     }
 
+    /**
+     * Date:2015/11/19
+     * TODO 此处暂时保留，因为AM不完全因为此条件，还有container数量的限制
+     * 在<code>AMRMClientAsyncImpl</code>中的<code>HeartbeatThread</code>中出错时才调用
+     * Called when the ResourceManager wants the ApplicationMaster to shutdown
+     * for being out of sync etc. The ApplicationMaster should not unregister
+     * with the RM unless the ApplicationMaster wants to be the last attempt.
+     */
+    // RM发送shutdown的指令，设置done=true，说明执行结束
     @Override
     public void onShutdownRequest() {
       done = true;
@@ -926,11 +987,17 @@ public class ApplicationMaster {
     @Override
     public float getProgress() {
       // set progress to deliver to RM on next heartbeat
-      float progress = (float) numCompletedContainers.get()
-          / numTotalContainers;
+      /**
+       * Date：2015/11/19
+       * 原来：根据container的执行数量决定进度
+       * 现在：AM作为long-running的service存在，所以一旦运行起来，进度就是100%
+       */
+      //float progress = (float) numCompletedContainers.get() / numTotalContainers;
+      float progress = 1.0f;
       return progress;
     }
 
+    // RM调用onError方法，说明出错，强制终止AM
     @Override
     public void onError(Throwable e) {
       done = true;
@@ -970,6 +1037,12 @@ public class ApplicationMaster {
         LOG.debug("Container Status: id=" + containerId + ", status=" +
             containerStatus);
       }
+      
+      // ************************
+      // to test what will output
+      // ************************
+      LOG.info("【Line 1038】Container Status: id=" + containerId + ", status=" +
+              containerStatus);
     }
 
     // 当 NM 新启动了 Containers 时，会调用改方法，把 Container 列表传给AM
@@ -981,19 +1054,20 @@ public class ApplicationMaster {
       }
       
       /**
-       * 以下是为了更改VM的状态
+       * 一旦container启动，就立刻返回更改VM的状态
+       * 因为如果等container执行完才更改状态的话，在启动VM时，container不会停止，VM状态也无法更改
        */
       Container container = containers.get(containerId);
       if (container != null) {
         applicationMaster.nmClientAsync.getContainerStatusAsync(containerId, container.getNodeId());
-        Task task;
+        Task task = null;
         try {
             task = pendingTaskQueue.take();
+            List<String> sqlList = new LinkedList<String>();
             if (task.getTargetObjectType().equals("VirtualMachine")) {
                 ContainerId containerID = vmToContainer.get(task.getTargetObjectId());
                 // 如果执行完的container就是目前task对应的container，那么就更改vm的状态
                 if (container.getId().equals(containerID)) {
-                    String status = null;
                     String sql = null;
                     // 在deploy/start/stop时才会发生状态变化
                     if (task.getOperation().equals("deploy") || task.getOperation().equals("stop")) {
@@ -1002,16 +1076,19 @@ public class ApplicationMaster {
                     else if (task.getOperation().equals("start")) {
                         sql = "update virtual_machines set status = 'running' where id = " + task.getTargetObjectId();
                     }
-                    LOG.info("更改VirtualMachine的状态： " + sql);
+                    LOG.info("[Line 1031: ]update VirtualMachine's status: " + sql);
+                    sqlList.add(sql);
+                    // TODO 暂时没有考虑job执行失败的情况
+                    sql = "update jobs set status = 'finished' where id = " + task.getJobId();
+                    sqlList.add(sql);
                     // 不能使用外边的con，原因在于con必须设置为static类型才可以，而这种做法会导致外边的con无法使用
-                    ConnectDataBase conn = new ConnectDataBase();                  
-                    conn.executeUpdate(sql);
+                    ConnectDataBase conn = new ConnectDataBase();
+                    conn.executeUpdates(sqlList);
                     conn = null;
                     //System.gc();
                 }
             }
         } catch (InterruptedException e) {
-            // TODO Auto-generated catch block
             e.printStackTrace();
         }
       }
@@ -1213,10 +1290,9 @@ public class ApplicationMaster {
 
   /**
    * Setup the request that will be sent to the RM for the container ask.
-   *
    * @return the setup ResourceRequest to be sent to RM
    */
-  private ContainerRequest setupContainerAskForRM() {
+  private ContainerRequest setupContainerAskForRM(int containerMemory, int containerVirtualCores) {
     // setup requirements for hosts
     // using * as any host will do for the ivic app
     // set the priority for the request
@@ -1249,6 +1325,7 @@ public class ApplicationMaster {
     }
   }
   
+  // 发布container启动的事件
   private static void publishContainerStartEvent(
       final TimelineClient timelineClient, Container container, String domainId,
       UserGroupInformation ugi) {
@@ -1278,6 +1355,7 @@ public class ApplicationMaster {
     }
   }
 
+  // 发布container终止的事件
   private static void publishContainerEndEvent(
       final TimelineClient timelineClient, ContainerStatus container,
       String domainId, UserGroupInformation ugi) {
@@ -1336,7 +1414,7 @@ public class ApplicationMaster {
     }
   }
   
-  //生产者线程，轮询数据库，读取job，然后
+  //生产者线程，轮询数据库，读取pendingJob
   class LoopJobReader implements Runnable {
       ResultSet rs = null;
       String sql;
@@ -1348,11 +1426,11 @@ public class ApplicationMaster {
               }
               // step1. schedule the pending jobs
               sql = "select * from jobs where status = 'pending' and user_id = " + userID;
-              LOG.info("读取pendingJob： " + sql);
+              //LOG.info("读取pendingJob： " + sql);
               rs = con.executeQuery(sql);
               try {
                   while (rs.next()) {
-                      LOG.info("开始分解Job！");
+                      LOG.info("开始解析Job！");
                       //jobId = rs.getString(0);
                       // TODO 将job分解为多个task,并将task放入队列;构建一个task队列和一个failed task的hashmap，相同的failed的job id的task至保存一个即可
                       TaskGenerator(con, rs);
@@ -1397,19 +1475,18 @@ public class ApplicationMaster {
    * @throws NumberFormatException 
    */
   private void TaskGenerator(ConnectDataBase con, ResultSet rs) throws NumberFormatException, SQLException {
-      LOG.info("进入TaskGenerator方法中！");
       if (con == null) {
           con = new ConnectDataBase();
       }
-	  LOG.info("[Function generate_tasks] get a new job to handler.");
+	  LOG.info("[Function TaskGenerator] get a new job to handler.");
 	  String jobId = rs.getString("id");
 	  String jobObject = rs.getString("target_object_type");
 	  String jobObjectId = rs.getString("target_object_id");
 	  String jobOperation = rs.getString("operation");
 	  String jobOption = rs.getString("options");
 	  
-	  containerMemory = 10;
-      containerVirtualCores = 1;
+	  //containerMemory = 10;
+      //containerVirtualCores = 1;
 	  
 	  // VM has operations: deploy, start, stop, undeploy
 	  if (jobObject.equals("VirtualMachine")) {
@@ -1506,7 +1583,7 @@ public class ApplicationMaster {
       //task.setSoapArgs(map.toString());
       task.setShellArgs(shellArgs);
       //task.setStatus(dependingTaskId == null ? "pending" : "waiting");
-      task.setStatus("pending"); // TODO 似乎没啥用。。
+      //task.setStatus("pending"); // TODO 似乎没啥用。。
       //task.setTitle(task.getOperation() + " vmi " + task.getTargetObjectId());
       SimpleDateFormat sDateFormat = new SimpleDateFormat("yyyy-MM-dd hh:mm:ss");     
       String createdTime = sDateFormat.format(new java.util.Date());
@@ -1521,9 +1598,8 @@ public class ApplicationMaster {
       //taskQueue.put(task);
       // job.status: pending => scheduling
       sql = "update jobs set status = 'scheduling' where id = " + jobId;
-      LOG.info("****** " + sql);
       con.executeUpdate(sql);
-      LOG.info("update jobs status from 'pending' to 'scheduling' success!");
+      LOG.info("*update job's status from pending to scheduling: " + sql);
   }
   
   // ****************************************************
@@ -1571,7 +1647,6 @@ public class ApplicationMaster {
           // ******************************************
           if (rs.getString("vm_temp_id") != null) {
               sql = "select url, os_type, os_distribution, os_release, os_kernel, os_packages from vm_temps where id = " + rs.getString("vm_temp_id");
-              System.out.println(sql);
               ResultSet set = con.executeQuery(sql);
               while (set.next()) {
                   Element vTemplateRef = doc.createElement("vTemplateRef");
@@ -1726,83 +1801,6 @@ public class ApplicationMaster {
       return xmlStr;
   }
   
-  private void doLoop(ConnectDataBase con) throws SQLException {
-      ResultSet rs = null;
-      //String jobId;
-      String sql;
-      while (true) {
-          if (con == null) {
-              con = new ConnectDataBase();
-          }
-          // step1. find out timeout tasks and update the status
-          // task只在taskQueue中保存，并不保存在portal的数据库中
-          // TODO 需不需要在数据库中保存task信息？ 需不需要设置时间间隔？是不是看container的执行结果就行？container会不会一直处于运行
-          /*
-          sql = "select id, target_object_id, target_object_type, updated_at from tasks where status = 'scheduling'";
-          rs = con.executeQuery(sql);
-          try {
-              while (rs.next()) {
-                  Date now = new Date();
-                  Date date = rs.getDate("updated_at");
-                  long timeInterval = now.getTime() - date.getTime();
-                  if (timeInterval >= 20 * 60 * 1000) { //最大时间间隔为20min
-                      List<String> sqlList = new ArrayList<String>();
-                      sql = "update tasks set status = 'failed', task_info = 'pending or scheduling time out' where id = " + rs.getString("id");
-                      LOG.info(sql);
-                      sqlList.add(sql);
-                      if (rs.getString("target_object_type") != null) {
-                          sql = "update " + tables.get(rs.getString("target_object_type")) + " set status = 'error' where id = " + rs.getString("target_object_id");
-                          sqlList.add(sql);
-                      }
-                      con.executeUpdates(sqlList);
-                      LOG.info("execute update success!");
-                  }
-              }
-          } catch (SQLException e) {
-              LOG.info("execute update failed!");
-              e.printStackTrace();
-          }*/
-
-          // step2. schedule the pending jobs
-          sql = "select id, target_object_id, target_object_type, operation, options from jobs where status = 'pending' and user_id = " + userID;
-          rs = con.executeQuery(sql);
-          try {
-              while (rs.next()) {
-                  //jobId = rs.getString(0);
-                  // TODO 将job分解为多个task,并将task放入队列;构建一个task队列和一个failed task的hashmap，相同的failed的job id的task至保存一个即可
-                  TaskGenerator(con, rs);
-
-                  // TODO 存在通过改ResultSet来更改数据库记录的方法
-                  // 如果有将task保存下来的功能则存在中间状态转换，但是如果将job解析完成后直接请求container执行咋办？   
-                  //sql = "update jobs set status = 'scheduling' where id = " + jobId;
-                  //con.executeUpdate(sql);
-                  //LOG.info("update jobs status success!");
-              }
-          }
-          catch (SQLException e) {
-              // TODO 原vshecd中将job.status=error
-              LOG.info("update jobs status failed!");
-              e.printStackTrace();
-          }
-          
-          // TODO 这一步在task状态执行完后，由执行结果修改job和vm的状态
-          // step3.update status of finished jobs
-          
-          // TODO 这一步和多线程有关，现在只实现单线程
-          // step5. handle the pending tasks
-          
-          // step6. sleep for 1 sec
-          // sleep(1);
-          try {
-              Thread.currentThread();
-              Thread.sleep(1000);
-          } catch (InterruptedException e) {
-              // TODO Auto-generated catch block
-              e.printStackTrace();
-          }
-      }
-  }
-  
   // TODO 这里先用单线程实现，后期可以改为多线程
   class TaskRunner implements Runnable {
       // private BlockingQueue<Task> queue;
@@ -1816,20 +1814,17 @@ public class ApplicationMaster {
       //ConnectDataBase con = new ConnectDataBase();
       String sql;
       public void run() {
-          LOG.info("开始执行TaskRunner.run()!");
-          Task task = null;
           while(true) {
+              Task task = null;
               try {
-                  LOG.info("TaskRunner从队列中读取task");
+                  LOG.info("get a task from taskQueue.");
                   // 队列为空，线程阻塞进入等待状态，直到有新对象加入为止
                   task = taskQueue.take();
                   // 取出要处理的task，然后申请container并将task保存在中间队列pendingTaskQueue中
                   pendingTaskQueue.put(task);
-                  LOG.info("TaskRunner读取task成功！");
-                  LOG.info("开始执行task！");
+                  LOG.info("Begin to execute task.");
                   doTask(task);
               } catch (InterruptedException e) {
-                  // TODO Auto-generated catch block
                   e.printStackTrace();
               }
           }
@@ -1839,15 +1834,14 @@ public class ApplicationMaster {
           if (con == null) {
               con = new ConnectDataBase();
           }
-          LOG.info("开始执行TaskRunner.doTask()!!");
           // 更新vm/vdisk的状态，变为执行中的状态
           if (task.getTargetObjectId() != null) {
               sql = "update " + tables.get(task.getTargetObjectType()) + " set status = '" + operationToState.get(task.getOperation()) + "' where id = " + task.getTargetObjectId();
-              LOG.info("更改虚拟机状态:" + sql);
+              LOG.info("update VM's status: " + sql);
               con.executeUpdate(sql);
           }
-          containerMemory = task.getMemory();
-          containerVirtualCores = task.getVcpu();
+          int containerMemory = task.getMemory();
+          int containerVirtualCores = task.getVcpu();
           
           // TODO 这里对于创建的VM不适用，公有云环境下，尽量保证资源可用，以及所提供最大资源足够大
           // A resource ask cannot exceed the max.
@@ -1874,7 +1868,7 @@ public class ApplicationMaster {
           // Keep looping until all the containers are launched and shell script
           // executed on them ( regardless of success/failure).
           // 申请资源的时候只和mem/vcpu有关，shell命令的其他内容等得到container后才能用到
-          ContainerRequest containerAsk = setupContainerAskForRM();
+          ContainerRequest containerAsk = setupContainerAskForRM(containerMemory, containerVirtualCores);
           extracted(containerAsk);
           
           publishApplicationAttemptEvent(timelineClient, appAttemptID.toString(),

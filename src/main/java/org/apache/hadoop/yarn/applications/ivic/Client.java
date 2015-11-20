@@ -215,17 +215,12 @@ public class Client {
    * @param args Command line arguments 
    */
   public static void main(String[] args) {
-	LOG.info("begin main()");
     boolean result = false;
     try {
-      LOG.info("begin to create client");
       Client client = new Client();
-      LOG.info("client初始化开始！");
       LOG.info("Initializing Client");
       try {
-    	LOG.info("开始执行init方法！");
         boolean doRun = client.init(args);//初始化，解析命令行参数
-        LOG.info("init方法执行完毕！");
         if (!doRun) {
           System.exit(0);
         }
@@ -234,7 +229,6 @@ public class Client {
         client.printUsage();
         System.exit(-1);
       }
-      LOG.info("开始执行run方法！");
       result = client.run();
     } catch (Throwable t) {
       LOG.fatal("Error running Client", t);
@@ -820,6 +814,10 @@ public class Client {
   private boolean monitorApplication(ApplicationId appId)
       throws YarnException, IOException {
 
+    /**
+     * Date: 2015/11/19
+     * client在AM处于running状态时就退出，就默认AM启动成功【或者再多监听几秒】 
+     */
     while (true) {
 
       // Check app status every 1 second.
@@ -846,20 +844,26 @@ public class Client {
           + ", appUser=" + report.getUser());
 
       // 得到application的运行状态
+      // 八种状态：NEW, NEW_SAVING, SUBMITTED, ACCEPTED, RUNNING, FINISHED, FAILED, KILLED
       YarnApplicationState state = report.getYarnApplicationState();
       // 得到application的最终状态
+      // 四种状态：UNDEFINED,SUCCEEDED,FAILED,KILLED
       FinalApplicationStatus dsStatus = report.getFinalApplicationStatus();
-      if (YarnApplicationState.FINISHED == state) {
+      if (YarnApplicationState.RUNNING == state) {
+          LOG.info("Application has launched successfully and is running now. Breaking monitoring loop");
+          return true;
+      }
+      else if (YarnApplicationState.FINISHED == state) {
         if (FinalApplicationStatus.SUCCEEDED == dsStatus) {
           LOG.info("Application has completed successfully. Breaking monitoring loop");
-          return true;        
+          return true;
         }
         else {
           LOG.info("Application did finished unsuccessfully."
               + " YarnState=" + state.toString() + ", DSFinalStatus=" + dsStatus.toString()
               + ". Breaking monitoring loop");
           return false;
-        }			  
+        }
       }
       else if (YarnApplicationState.KILLED == state	
           || YarnApplicationState.FAILED == state) {
@@ -870,8 +874,10 @@ public class Client {
       }			
 
       /**
-       * 超过10min，就把AppMaster杀死；也就是不管作业是否成功都会把AppMaster杀死的
-       * TODO 这里暂时保留，可以不断杀死测试产生的AM；但是在最终环境中，需要注释掉这段代码，保证AM能够长时间运行
+       * Date： 2015/11/20
+       * 以前：超过10min，就把AppMaster杀死；也就是不管作业是否成功都会把AppMaster杀死的
+       *      但是在正常情况下，AppMaster在规定时间内是可以因为执行完成或任务失败而退出的
+       * 现在：注释掉代码，在正常情况下，AM一旦运行起来，client就立即退出；所以该段代码即使保留也不会被执行
        */
       if (System.currentTimeMillis() > (clientStartTime + clientTimeout)) {
         LOG.info("Reached client specified timeout for application. Killing application");
@@ -884,7 +890,6 @@ public class Client {
 
   /**
    * 可以删除指定的AppMaster.
-   * TODO - 保留这个功能，iVIC5.0中，当用户没有相应业务，并且很久没有登陆，是不是就可以杀掉该用户对应的AppMaster以节省资源？
    * TODO - 方法体中提到，要验证是不是多个job可以同时提交到同一个AppMaster.但在iVIC5.0中，job是一个队列，按顺序处理，还是多线程？？？
    * 
    * Kill a submitted application by sending a call to the ASM
